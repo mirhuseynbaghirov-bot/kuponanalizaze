@@ -1,0 +1,182 @@
+import os
+import time
+import asyncio
+import threading
+from collections import defaultdict
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from zoneinfo import ZoneInfo
+
+import requests
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ODDS_API_KEY = os.environ["ODDS_API_KEY"]
+TZ = ZoneInfo("Asia/Baku")
+
+# Popular leagues (The Odds API sport keys)
+LEAGUES = [
+    "soccer_uefa_champs_league",
+    "soccer_epl",
+    "soccer_spain_la_liga",
+    "soccer_italy_serie_a",
+    "soccer_germany_bundesliga",
+    "soccer_france_ligue_one",
+]
+
+# Each tier: odds band for a single pick, and target total odds range
+TIERS = {
+    "safe": {"name": "🛡 Ehtiyatlı kupon", "pick_lo": 1.15, "pick_hi": 1.60, "lo": 2.0, "hi": 5.0},
+    "normal": {"name": "⚖️ Normal kupon", "pick_lo": 1.40, "pick_hi": 2.20, "lo": 5.0, "hi": 10.0},
+    "risky": {"name": "🔥 Riskli kupon", "pick_lo": 1.70, "pick_hi": 3.00, "lo": 10.0, "hi": 20.0},
+}
+
+CACHE_TTL = 30 * 60  # 30 min, saves API credits
+_cache = {"time": 0, "picks": []}
+
+
+def fair_probs(odds_by_name):
+    """Remove bookmaker margin: normalise implied probabilities."""
+    inv = {k: 1 / v for k, v in odds_by_name.items()}
+    total = sum(inv.values())
+    return {k: v / total for k, v in inv.items()}
+
+
+def avg(values):
+    return sum(values) / len(values)
+
+
+def fetch_picks():
+    """Return list of candidate picks for today's matches."""
+    today = datetime.now(TZ).date()
+    picks = []
+    for league in LEAGUES:
+        r = requests.get(
+            f"https://api.the-odds-api.com/v4/sports/{league}/odds/",
+            params={
+                "apiKey": ODDS_API_KEY,
+                "regions": "eu",
+                "markets": "h2h,totals",
+                "oddsFormat": "decimal",
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            continue
+        for ev in r.json():
+            start = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00")).astimezone(TZ)
+            if start.date() != today:
+                continue
+            home, away = ev["home_team"], ev["away_team"]
+            h2h = defaultdict(list)
+            totals = defaultdict(list)
+            for bk in ev["bookmakers"]:
+                for m in bk["markets"]:
+                    if m["key"] == "h2h":
+                        for o in m["outcomes"]:
+                            h2h[o["name"]].append(o["price"])
+                    elif m["key"] == "totals":
+                        for o in m["outcomes"]:
+                            if o.get("point") == 2.5:
+                                totals[o["name"]].append(o["price"])
+            title = f"{home} - {away}"
+            when = start.strftime("%H:%M")
+            if len(h2h) == 3:
+                odds = {k: avg(v) for k, v in h2h.items()}
+                probs = fair_probs(odds)
+                labels = {home: f"{home} qalib", away: f"{away} qalib", "Draw": "Heç-heçə"}
+                for k in odds:
+                    picks.append(dict(match=title, time=when, pick=labels.get(k, k),
+                                      odds=odds[k], prob=probs[k]))
+            if len(totals) == 2:
+                odds = {k: avg(v) for k, v in totals.items()}
+                probs = fair_probs(odds)
+                labels = {"Over": "2.5 Üst", "Under": "2.5 Alt"}
+                for k in odds:
+                    picks.append(dict(match=title, time=when, pick=labels.get(k, k),
+                                      odds=odds[k], prob=probs[k]))
+    return picks
+
+
+def get_picks():
+    if time.time() - _cache["time"] > CACHE_TTL:
+        _cache["picks"] = fetch_picks()
+        _cache["time"] = time.time()
+    return _cache["picks"]
+
+
+def build_coupon(picks, tier):
+    t = TIERS[tier]
+    cands = [p for p in picks if t["pick_lo"] <= p["odds"] <= t["pick_hi"]]
+    cands.sort(key=lambda p: p["prob"], reverse=True)  # most likely first
+    chosen, used, total = [], set(), 1.0
+    for p in cands:
+        if p["match"] in used:
+            continue
+        if total * p["odds"] > t["hi"]:
+            continue
+        chosen.append(p)
+        used.add(p["match"])
+        total *= p["odds"]
+        if total >= t["lo"]:
+            break
+    return chosen, total
+
+
+def format_coupon(tier, chosen, total):
+    t = TIERS[tier]
+    if not chosen:
+        return f"{t['name']}\n\nBu gün üçün uyğun matç tapılmadı."
+    win_prob = 1.0
+    lines = [f"{t['name']} (ümumi kef ≈ {total:.2f})\n"]
+    for i, p in enumerate(chosen, 1):
+        win_prob *= p["prob"]
+        lines.append(f"{i}. {p['match']} ({p['time']})\n   ➜ {p['pick']} | kef {p['odds']:.2f}")
+    lines.append(f"\nÜmumi uduş ehtimalı (bazar əsasında): ~{win_prob * 100:.0f}%")
+    if total < t["lo"]:
+        lines.append("⚠️ Bu gün kifayət qədər matç olmadığı üçün hədəf kefə çatmadı.")
+    lines.append("\n⚠️ Zəmanət yoxdur. Yalnız itirə biləcəyin məbləği qoy.")
+    return "\n".join(lines)
+
+
+async def gununoyunlari(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔥 Riskli kupon (10-20)", callback_data="risky")],
+        [InlineKeyboardButton("⚖️ Normal kupon (5-10)", callback_data="normal")],
+        [InlineKeyboardButton("🛡 Ehtiyatlı kupon (1-5)", callback_data="safe")],
+    ])
+    await update.message.reply_text("Hansı kuponu istəyirsən?", reply_markup=kb)
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    tier = q.data
+    await q.message.reply_text("Matçlar yoxlanılır...")
+    picks = await asyncio.to_thread(get_picks)
+    chosen, total = build_coupon(picks, tier)
+    await q.message.reply_text(format_coupon(tier, chosen, total))
+
+
+class Ping(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *args):
+        pass
+
+
+def keep_alive():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), Ping).serve_forever()
+
+
+if __name__ == "__main__":
+    threading.Thread(target=keep_alive, daemon=True).start()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("gununoyunlari", gununoyunlari))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.run_polling()
