@@ -1,6 +1,7 @@
 import os
 import time
 import asyncio
+import logging
 import threading
 from collections import defaultdict
 from datetime import datetime
@@ -11,8 +12,16 @@ import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("kuponbot")
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ODDS_API_KEY = os.environ["ODDS_API_KEY"]
+ADMIN_ID = os.environ.get("ADMIN_ID")  # ixtiyari: sənin Telegram ID-n, xəbərdarlıq üçün
 TZ = ZoneInfo("Asia/Baku")
 
 # Popular leagues (The Odds API sport keys)
@@ -32,8 +41,16 @@ TIERS = {
     "risky": {"name": "🔥 Riskli kupon", "pick_lo": 1.70, "pick_hi": 3.00, "lo": 10.0, "hi": 20.0},
 }
 
-CACHE_TTL = 30 * 60  # 30 min, saves API credits
-_cache = {"time": 0, "picks": []}
+# ---------- Keş: hər liqa gündə bir dəfə çəkilir (kredit qənaəti) ----------
+RETRY_AFTER_FAIL = 10 * 60  # uğursuz liqanı 10 dəqiqədən sonra yenidən yoxla
+_cache = {}  # liqa -> {"day", "t", "ok", "picks"}
+_lock = threading.Lock()
+
+# ---------- Sağlamlıq yoxlaması (watchdog) ----------
+BEAT_EVERY = 30
+DEAD_AFTER = 180  # saniyə: bu qədər heartbeat yoxdursa proses yenidən başladılır
+_beat = {"t": time.time()}
+_last_admin_alert = {"t": 0.0}
 
 
 def fair_probs(odds_by_name):
@@ -47,11 +64,10 @@ def avg(values):
     return sum(values) / len(values)
 
 
-def fetch_picks():
-    """Return list of candidate picks for today's matches."""
-    today = datetime.now(TZ).date()
+def fetch_league(league, today):
+    """Bir liqanın bu günkü matç variantlarını qaytarır: (picks, ok)."""
     picks = []
-    for league in LEAGUES:
+    try:
         r = requests.get(
             f"https://api.the-odds-api.com/v4/sports/{league}/odds/",
             params={
@@ -62,8 +78,14 @@ def fetch_picks():
             },
             timeout=20,
         )
+        log.info(
+            "%s | status=%s | qalan kredit=%s",
+            league, r.status_code, r.headers.get("x-requests-remaining"),
+        )
         if r.status_code != 200:
-            continue
+            log.warning("%s | API xətası: %s", league, r.text[:200])
+            return picks, False
+
         for ev in r.json():
             start = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00")).astimezone(TZ)
             if start.date() != today:
@@ -96,14 +118,31 @@ def fetch_picks():
                 for k in odds:
                     picks.append(dict(match=title, time=when, pick=labels.get(k, k),
                                       odds=odds[k], prob=probs[k]))
-    return picks
+        return picks, True
+    except Exception:
+        log.exception("%s | liqa çəkilərkən xəta", league)
+        return [], False
 
 
 def get_picks():
-    if time.time() - _cache["time"] > CACHE_TTL:
-        _cache["picks"] = fetch_picks()
-        _cache["time"] = time.time()
-    return _cache["picks"]
+    """Bütün liqaların variantları + hamısı uğurlu olub-olmadığı."""
+    today = datetime.now(TZ).date()
+    all_picks, all_ok = [], True
+    with _lock:
+        for league in LEAGUES:
+            c = _cache.get(league)
+            fresh = (
+                c
+                and c["day"] == today
+                and (c["ok"] or time.time() - c["t"] < RETRY_AFTER_FAIL)
+            )
+            if not fresh:
+                picks, ok = fetch_league(league, today)
+                c = {"day": today, "t": time.time(), "ok": ok, "picks": picks}
+                _cache[league] = c
+            all_picks += c["picks"]
+            all_ok = all_ok and c["ok"]
+    return all_picks, all_ok
 
 
 def build_coupon(picks, tier):
@@ -140,6 +179,21 @@ def format_coupon(tier, chosen, total):
     return "\n".join(lines)
 
 
+async def alert_admin(context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Admin-ə saatda ən çox 1 xəbərdarlıq göndərir."""
+    if not ADMIN_ID or time.time() - _last_admin_alert["t"] < 3600:
+        return
+    _last_admin_alert["t"] = time.time()
+    try:
+        await context.bot.send_message(int(ADMIN_ID), text)
+    except Exception:
+        log.exception("Admin-ə mesaj göndərilə bilmədi")
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Salam! Günün kuponunu almaq üçün /gununoyunlari yaz.")
+
+
 async def gununoyunlari(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔥 Riskli kupon (10-20)", callback_data="risky")],
@@ -153,17 +207,63 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     tier = q.data
+    if tier not in TIERS:
+        return
     await q.message.reply_text("Matçlar yoxlanılır...")
-    picks = await asyncio.to_thread(get_picks)
+    try:
+        picks, ok = await asyncio.to_thread(get_picks)
+    except Exception:
+        log.exception("get_picks xətası")
+        await q.message.reply_text("⚠️ Xəta baş verdi. Bir az sonra yenidən yoxla.")
+        return
+    if not picks and not ok:
+        await alert_admin(context, "⚠️ Kupon botu: matç məlumatı alınmır (Odds API limiti bitmiş ola bilər). Render Logs-a bax.")
+        await q.message.reply_text("⚠️ Matç məlumatı hazırda alına bilmir. Bir az sonra yenidən yoxla.")
+        return
     chosen, total = build_coupon(picks, tier)
     await q.message.reply_text(format_coupon(tier, chosen, total))
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Handler xətası", exc_info=context.error)
+
+
+# ---------- Heartbeat + watchdog ----------
+async def heartbeat_loop(app: Application):
+    """Bot event loop-u canlıdırsa və polling işləyirsə, hər 30 san. nəbz yazır."""
+    while True:
+        up = app.updater
+        if up is None or getattr(up, "running", True):
+            _beat["t"] = time.time()
+        await asyncio.sleep(BEAT_EVERY)
+
+
+async def post_init(app: Application):
+    app.bot_data["hb"] = asyncio.create_task(heartbeat_loop(app))
+
+
+def watchdog():
+    """Nəbz kəsilibsə prosesi öldürür; Render onu avtomatik yenidən başladır."""
+    while True:
+        time.sleep(BEAT_EVERY)
+        if time.time() - _beat["t"] > DEAD_AFTER:
+            log.error("Heartbeat yoxdur, bot donub. Proses yenidən başladılır.")
+            os._exit(1)
+
+
 class Ping(BaseHTTPRequestHandler):
+    def _status(self):
+        return 200 if time.time() - _beat["t"] < DEAD_AFTER else 500
+
     def do_GET(self):
-        self.send_response(200)
+        code = self._status()
+        self.send_response(code)
         self.end_headers()
-        self.wfile.write(b"ok")
+        self.wfile.write(b"ok" if code == 200 else b"bot down")
+
+    def do_HEAD(self):
+        self.send_response(self._status())
+        self.end_headers()
 
     def log_message(self, *args):
         pass
@@ -176,7 +276,11 @@ def keep_alive():
 
 if __name__ == "__main__":
     threading.Thread(target=keep_alive, daemon=True).start()
-    app = Application.builder().token(BOT_TOKEN).build()
+    threading.Thread(target=watchdog, daemon=True).start()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("gununoyunlari", gununoyunlari))
     app.add_handler(CallbackQueryHandler(on_button))
-    app.run_polling()
+    app.add_error_handler(on_error)
+    # drop_pending_updates: yenidən başlayanda köhnə yığılmış mesajlara cavab yağdırmasın
+    app.run_polling(drop_pending_updates=True)
