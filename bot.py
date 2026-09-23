@@ -19,6 +19,7 @@ Mühit dəyişənləri (Render → Environment):
     kredit yalnız bu gün oyunu olan liqalara xərclənir, gündəlik büdcə var.
   * Statistika (/admin): kim, neçə dəfə, hansı mənbədən (reklam linki) gəlib.
   * Watchdog: bot donsa proses özü yenidən başlayır.
+  * Mühit dəyişənlərindəki artıq boşluq / yeni sətir / dırnaq avtomatik təmizlənir.
 """
 import asyncio
 import json
@@ -52,13 +53,24 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("kuponbot")
 
+
 # ============================== KONFİQURASİYA ==============================
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ODDS_API_KEY = os.environ["ODDS_API_KEY"]
-ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_ID", ""))}
-DEFAULT_LANG = os.environ.get("DEFAULT_LANG", "az")
-DAILY_CREDIT_BUDGET = int(os.environ.get("DAILY_CREDIT_BUDGET", "16"))
-CONTACT = os.environ.get("CONTACT", "")
+def env(name, default=""):
+    """Mühit dəyişənini oxuyur; başdakı/sondakı boşluq, \\n və dırnaqları təmizləyir."""
+    return os.environ.get(name, default).strip().strip("\"'").strip()
+
+
+BOT_TOKEN = env("BOT_TOKEN")
+ODDS_API_KEY = env("ODDS_API_KEY")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN təyin edilməyib (Render → Environment)")
+if not ODDS_API_KEY:
+    raise RuntimeError("ODDS_API_KEY təyin edilməyib (Render → Environment)")
+
+ADMIN_IDS = {int(x) for x in re.findall(r"\d+", env("ADMIN_ID"))}
+DEFAULT_LANG = env("DEFAULT_LANG", "az")
+DAILY_CREDIT_BUDGET = int(env("DAILY_CREDIT_BUDGET", "16") or 16)
+CONTACT = env("CONTACT")
 TZ = ZoneInfo("Asia/Baku")
 
 ODDS_BASE = "https://api.the-odds-api.com/v4"
@@ -293,8 +305,8 @@ class RedisREST:
     persistent = True
 
     def __init__(self, url, token):
-        self.url = url.rstrip("/")
-        self.headers = {"Authorization": f"Bearer {token}"}
+        self.url = url.strip().rstrip("/")
+        self.headers = {"Authorization": f"Bearer {token.strip()}"}
 
     def _cmd(self, *args):
         r = requests.post(self.url, headers=self.headers,
@@ -338,9 +350,11 @@ class RedisREST:
 
 
 def make_kv():
-    url = os.environ.get("UPSTASH_REDIS_REST_URL")
-    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+    url = env("UPSTASH_REDIS_REST_URL")
+    token = env("UPSTASH_REDIS_REST_TOKEN")
     if url and token:
+        if not url.startswith("https://"):
+            log.error("UPSTASH_REDIS_REST_URL 'https://' ilə başlamalıdır (redis:// yox!)")
         log.info("Yaddaş: Upstash Redis")
         return RedisREST(url, token)
     log.warning("Yaddaş: MÜVƏQQƏTİ (UPSTASH_* təyin edilməyib) — restartda statistika silinir")
@@ -372,7 +386,6 @@ class Stats:
         """İstifadəçini qeyd edir. Yeni idisə True qaytarır (mənbə də saxlanır)."""
         if (uid, name) in self._known:
             return False
-        self._known.add((uid, name))
         is_new = self.kv.sadd("users:all", uid) == 1
         self.kv.hset(f"u:{uid}", "name", name)
         if is_new:
@@ -381,6 +394,7 @@ class Stats:
             self.kv.hset(f"u:{uid}", "src", src)
             self.kv.hincrby(f"d:{day}:tot", "new", 1)
             self.kv.hincrby(f"d:{day}:src", src, 1)
+        self._known.add((uid, name))  # yalnız uğurlu yazışdan sonra
         return is_new
 
     def log_coupon(self, uid, tier):
@@ -1052,7 +1066,7 @@ class Ping(BaseHTTPRequestHandler):
 
 
 def keep_alive():
-    port = int(os.environ.get("PORT", 10000))
+    port = int(env("PORT", "10000") or 10000)
     HTTPServer(("0.0.0.0", port), Ping).serve_forever()
 
 
