@@ -103,6 +103,7 @@ LOW_CREDIT_WARN = 60        # Odds API krediti bundan aşağı düşəndə admin
 RETRY_AFTER_FAIL = 10 * 60  # uğursuz yükləməni 10 dəq. sonra yenidən yoxla
 STATS_RETRY = 15 * 60       # statistika uğursuz olubsa 15 dəq. sonra yenidən yoxla
 MAX_FETCH_TRIES = 3         # natamam baza ən çox bu qədər yenidən yüklənir (kredit büdcəsi daxilində)
+THIN_SNAPSHOT = 6           # bazada bundan az oyun varsa "natamam" sayılır və yenidən yoxlanır (oyun-yoxlaması PULSUZDUR)
 COOLDOWN = 2.0              # eyni istifadəçinin düymə basma fasiləsi (saniyə)
 MIN_MINUTES_BEFORE_KICKOFF = 15  # başlamağa 15 dəq. qalmış oyunları kupona salma
 
@@ -254,7 +255,9 @@ TXT = {
         "a_stats": "📈 Statistika: {v}/{m} oyun təsdiqlənib · API-Football sorğu {c} · qalan {r}{err}",
         "a_stats_off": "📈 Statistika söndürülüb (API_FOOTBALL_KEY yoxdur) — kuponlar yalnız bazar kefinə əsaslanır.",
         "a_limit": "🎟 İstifadəçi limiti: gündə {n} kupon",
-        "a_partial": "⚠️ Baza natamamdır (cəhd {t}/{m}) — bot özü yenidən yoxlayacaq.",
+        "a_partial": "⚠️ Baza natamamdır (cəhd {t}/{m}, uğursuz sorğu {f}) — bot özü yenidən yoxlayacaq. Dərhal yeniləmək üçün: /yenile",
+        "r_wait": "⏳ Baza yenilənir...",
+        "r_done": "🔄 Yeniləndi: {m} oyun · {l} liqada oyun var · uğursuz sorğu {f} · Odds API qalan {r}\n\n{lg}",
         "a_credits": "💳 Bu gün Odds API xərci: əsas {o}/{ob} · korner/kart {x}/{xb}",
         "a_snap_none": "⚽ Oyun bazası hələ yüklənməyib.",
         "a_none": "hələ yoxdur",
@@ -346,7 +349,9 @@ TXT = {
         "a_stats": "📈 Stats: {v}/{m} matches verified · API-Football calls {c} · remaining {r}{err}",
         "a_stats_off": "📈 Stats disabled (no API_FOOTBALL_KEY) — coupons rely on market odds only.",
         "a_limit": "🎟 User limit: {n} coupons per day",
-        "a_partial": "⚠️ Match data is incomplete (attempt {t}/{m}) — the bot will retry by itself.",
+        "a_partial": "⚠️ Match data is incomplete (attempt {t}/{m}, failed requests {f}) — the bot will retry by itself. Refresh now: /yenile",
+        "r_wait": "⏳ Refreshing match data...",
+        "r_done": "🔄 Refreshed: {m} matches · {l} leagues with games · failed requests {f} · Odds API remaining {r}\n\n{lg}",
         "a_credits": "💳 Odds API spent today: main {o}/{ob} · corners/cards {x}/{xb}",
         "a_snap_none": "⚽ Match database not loaded yet.",
         "a_none": "none yet",
@@ -621,13 +626,14 @@ class Snapshot:
     fb_err: str = ""           # "plan" / "quota" / "auth" / "budget" və ya boş
     partial: bool = False      # bəzi sorğular uğursuz olub / oyun tapılmayıb → bir az sonra yenidən yoxlanacaq
     tries: int = 0             # bazanın neçə dəfə yüklənməsi cəhdi
+    fails: int = 0             # son yükləmədə uğursuz Odds API sorğularının sayı
 
     def to_json(self):
         return json.dumps(dict(
             day=self.day, spent=self.spent, remaining=self.remaining,
             leagues=self.leagues, ok=self.ok, extras=self.extras,
             stats_done=self.stats_done, fb_calls=self.fb_calls,
-            fb_left=self.fb_left, fb_err=self.fb_err, partial=self.partial, tries=self.tries,
+            fb_left=self.fb_left, fb_err=self.fb_err, partial=self.partial, tries=self.tries, fails=self.fails,
             matches=[dict(id=m.id, home=m.home, away=m.away, start=m.start.isoformat(),
                           league_key=m.league_key, league=m.league, top=m.top,
                           p3=list(m.p3) if m.p3 else None, info=m.info,
@@ -648,7 +654,7 @@ class Snapshot:
         return Snapshot(d["day"], matches, d["spent"], d["remaining"], d["leagues"], d["ok"],
                         d.get("extras", False), d.get("stats_done", False),
                         d.get("fb_calls", 0), d.get("fb_left"), d.get("fb_err", ""),
-                        d.get("partial", False), d.get("tries", 0))
+                        d.get("partial", False), d.get("tries", 0), d.get("fails", 0))
 
 
 def _avg(values):
@@ -782,13 +788,27 @@ def discover_leagues():
 
 
 def league_events(key, t_from, t_to):
-    """Liqanın pəncərədəki oyunları. /events PULSUZDUR. Xəta olsa None."""
-    try:
-        r = _get(f"/sports/{key}/events", commenceTimeFrom=_iso(t_from), commenceTimeTo=_iso(t_to))
-        return r.json() if r.status_code == 200 else None
-    except Exception:
-        log.warning("%s | events xətası", key)
-        return None
+    """
+    Liqanın pəncərədəki oyunları. /events PULSUZDUR.
+    Müvəqqəti xətada (429/5xx/şəbəkə) 3 dəfəyə qədər təkrar cəhd edir. Hələ də alınmırsa None (= xəta).
+    404/422 "bu liqada oyun yoxdur" deməkdir → [].
+    """
+    for attempt in range(3):
+        try:
+            r = _get(f"/sports/{key}/events", commenceTimeFrom=_iso(t_from), commenceTimeTo=_iso(t_to))
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (404, 422):
+                return []
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            log.warning("%s | events status=%s", key, r.status_code)
+            return None
+        except Exception:
+            time.sleep(1.0)
+    log.warning("%s | events xətası (3 cəhddən sonra)", key)
+    return None
 
 
 def fetch_day(prev=None):
@@ -801,10 +821,12 @@ def fetch_day(prev=None):
     now = datetime.now(TZ)
     t_to = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)   # bu günün sonu (Bakı)
     leagues, remaining = discover_leagues()
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:      # az paralel: Odds API sürət limitinə (429) düşməmək üçün
         found = list(ex.map(lambda kt: (kt, league_events(kt[0], now, t_to)), leagues))
-    ev_failed = sum(1 for (k, _t), evs in found if evs is None and k in TOP_LEAGUES)
+    ev_failed = sum(1 for _kt, evs in found if evs is None)
     active = [(k, t, evs) for (k, t), evs in found if evs]
+    log.info("Odds API: %d futbol liqası, %d-də bu gün oyun var, %d liqada events sorğusu uğursuz",
+             len(leagues), len(active), ev_failed)
     # Əvvəl məşhur liqalar, sonra oyun sayı çox olan əlavə liqalar
     active.sort(key=lambda x: (0, TOP_LEAGUES.index(x[0])) if x[0] in TOP_LEAGUES else (1, -len(x[2])))
 
@@ -849,13 +871,13 @@ def fetch_day(prev=None):
         except Exception:
             log.exception("%s | parse xətası", key)
     ok = bool(matches) or not quota_out
-    partial = (not matches) or fails > 0 or ev_failed > 0
+    partial = (not matches) or fails > 0 or ev_failed > 0 or len(matches) < THIN_SNAPSHOT
     tries = (prev.tries if prev else 0) + 1
     log.info("Baza: %d liqa aktiv, %d oyun, %d kredit xərcləndi, qalan=%s, uğursuz sorğu=%d, natamam=%s (cəhd %d)",
              len(active), len(matches), spent, remaining, fails + ev_failed, partial, tries)
     return Snapshot(now.date().isoformat(), matches, (prev.spent if prev else 0) + spent, remaining,
                     len(active), ok, extras=prev.extras if prev else False,
-                    partial=partial, tries=tries)
+                    partial=partial, tries=tries, fails=fails + ev_failed)
 
 
 def enrich_extras(snap):
@@ -1255,6 +1277,20 @@ _snap = {"day": None, "t": 0.0, "st": 0.0, "data": None, "ok": False}
 _snap_lock = threading.Lock()
 
 
+def force_refresh():
+    """Admin: bu günün bazasını dərhal yenidən yüklə. Artıq alınmış liqalar təkrar alınmır, gündəlik kredit tavanı qüvvədədir."""
+    today = datetime.now(TZ).date().isoformat()
+    with _snap_lock:
+        s = _snap
+        prev = s["data"] if s["day"] == today else None
+        data = fetch_day(prev)
+        data.tries = 1
+        s.update(day=today, t=time.time(), st=time.time(), data=data, ok=data.ok)
+        if data.ok:
+            _finish_snapshot(today, data)
+        return data
+
+
 def _finish_snapshot(today, data):
     """Odds API korner/kart + API-Football statistika mərhələləri, sonra Redis-ə yazır."""
     try:
@@ -1301,12 +1337,15 @@ def get_snapshot():
                 raw = kv.get(f"snap:{today}")
                 if raw:
                     data = Snapshot.from_json(raw)
+                    if len(data.matches) < THIN_SNAPSHOT and data.tries < MAX_FETCH_TRIES:
+                        data.partial = True            # nazik/köhnə baza → aşağıda dərhal yenidən yoxlanır
                     if not data.extras or (STATS_MODE and not data.stats_done):
                         s["st"] = time.time()
                         _finish_snapshot(today, data)
                     s.update(day=today, t=time.time(), data=data, ok=True)
-                    log.info("Baza Redis-dən yükləndi")
-                    return s["data"], True
+                    log.info("Baza Redis-dən yükləndi (%d oyun, natamam=%s)", len(data.matches), data.partial)
+                    if not data.partial or data.tries >= MAX_FETCH_TRIES:
+                        return s["data"], True
             except Exception:
                 log.exception("Redis snapshot oxunmadı")
         prev = s["data"] if s["day"] == today else None
@@ -1322,7 +1361,8 @@ def get_snapshot():
                 s["st"] = time.time()
                 _finish_snapshot(today, data)
         else:
-            s["ok"] = False  # köhnə (eyni günün) məlumatı varsa saxlanır
+            # yeniləmə alınmadı: eyni günün köhnə bazası varsa ondan istifadə olunur (vəziyyəti dəyişmir), 10 dəq. sonra yenidən cəhd
+            s["ok"] = prev.ok if prev is not None else False
         return s["data"], s["ok"]
 
 
@@ -1670,7 +1710,7 @@ def format_admin(lang, rep, snap):
         out.append(L["a_credits"].format(o=credits_used("odds"), ob=DAILY_CREDIT_BUDGET,
                                          x=credits_used("extra"), xb=EXTRA_CREDIT_BUDGET))
         if snap.partial:
-            out.append(L["a_partial"].format(t=snap.tries, m=MAX_FETCH_TRIES))
+            out.append(L["a_partial"].format(t=snap.tries, m=MAX_FETCH_TRIES, f=snap.fails))
         if STATS_MODE:
             v = sum(1 for m in snap.matches if m.info and m.info.get("ok"))
             err = f" · ⚠️ {snap.fb_err}" if snap.fb_err else ""
@@ -1783,6 +1823,24 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Statistika oxunmadı. Render Logs-a bax.")
         return
     await update.message.reply_text(format_admin(lang, rep, _snap["data"]))
+
+
+async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return
+    L = T(await user_lang(user))
+    msg = await update.message.reply_text(L["r_wait"])
+    try:
+        d = await asyncio.to_thread(force_refresh)
+    except Exception:
+        log.exception("/yenile xətası")
+        await msg.edit_text(L["gen_error"])
+        return
+    cnt = Counter(m.league for m in d.matches)
+    lg = ", ".join(f"{k} ({v})" for k, v in cnt.most_common(12)) or "—"
+    rem = d.remaining if d.remaining is not None else "?"
+    await msg.edit_text(L["r_done"].format(m=len(d.matches), l=d.leagues, f=d.fails, r=rem, lg=lg))
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1965,6 +2023,7 @@ def main():
     app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler(["yenile", "refresh"], cmd_refresh))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
     # drop_pending_updates: restartda köhnə yığılmış mesajlara cavab yağdırmasın
