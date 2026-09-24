@@ -668,12 +668,12 @@ def make_legs(o_home, o_draw, o_away, over=None, under=None):
     return legs
 
 
-def parse_league_odds(data, key, title, top, now):
-    """Bir liqanın Odds API cavabından hələ başlamamış oyunları çıxarır."""
+def parse_league_odds(data, key, title, top, now, t_end=None):
+    """Bir liqanın Odds API cavabından hələ başlamamış və (t_end verilibsə) həmin vaxtdan əvvəl başlayan oyunları çıxarır."""
     out = []
     for ev in data:
         start = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00")).astimezone(TZ)
-        if start <= now:
+        if start <= now or (t_end is not None and start >= t_end):
             continue
         home, away = ev["home_team"], ev["away_team"]
         h2h, totals = defaultdict(list), defaultdict(list)
@@ -771,7 +771,7 @@ def fetch_day():
       3) yalnız oyunu olan liqalar üçün kef çək (kredit), gündəlik büdcə daxilində.
     """
     now = datetime.now(TZ)
-    t_to = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(hours=30)
+    t_to = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)   # bu günün sonu (Bakı)
     leagues, remaining = discover_leagues()
     with ThreadPoolExecutor(max_workers=8) as ex:
         found = list(ex.map(lambda kt: (kt, league_events(kt[0], now, t_to)), leagues))
@@ -789,7 +789,8 @@ def fetch_day():
             break
         try:
             r = _get(f"/sports/{key}/odds", regions="eu", oddsFormat="decimal",
-                     markets="h2h,totals" if top else "h2h")
+                     markets="h2h,totals" if top else "h2h",
+                     commenceTimeFrom=_iso(now), commenceTimeTo=_iso(t_to))
         except Exception:
             log.warning("%s | odds sorğusu uğursuz", key)
             continue
@@ -807,7 +808,7 @@ def fetch_day():
             continue
         spent += cost
         try:
-            matches += parse_league_odds(r.json(), key, title, top, now)
+            matches += parse_league_odds(r.json(), key, title, top, now, t_to)
         except Exception:
             log.exception("%s | parse xətası", key)
     ok = bool(matches) or not quota_out
@@ -828,7 +829,8 @@ def enrich_extras(snap):
     if EXTRA_CREDIT_BUDGET < 2:
         return
     now = datetime.now(TZ)
-    pool = sorted((m for m in snap.matches if m.top and m.start > now + timedelta(minutes=60)),
+    pool = sorted((m for m in snap.matches
+                   if m.top and m.start.date() == now.date() and m.start > now + timedelta(minutes=60)),
                   key=lambda m: m.start)
     spent, added, remaining = 0, 0, snap.remaining
     for m in pool:
@@ -1169,7 +1171,8 @@ def enrich_stats(snap):
         return
     api = FootballAPI(FOOTBALL_KEY, FOOTBALL_DAILY_BUDGET)
     day = datetime.now(TZ).date().isoformat()
-    cand = sorted((m for m in snap.matches if not (m.info and m.info.get("ok"))),
+    cand = sorted((m for m in snap.matches
+                   if m.start.date() == datetime.now(TZ).date() and not (m.info and m.info.get("ok"))),
                   key=lambda m: (not m.top, m.start))[:STATS_MAX_MATCHES]
     dates = sorted({m.start.date().isoformat() for m in cand})
     fixtures = []
@@ -1407,7 +1410,9 @@ def build_coupon(matches, tier, variant=0, now=None):
     cfg = TIERS[tier]
     now = now or datetime.now(TZ)
     rng = random.Random(f"{now.date().isoformat()}|{tier}|{variant}")
-    pool = [m for m in matches if m.start > now + timedelta(minutes=MIN_MINUTES_BEFORE_KICKOFF)]
+    pool = [m for m in matches
+            if m.start.date() == now.date()                                   # yalnız bu gün (Bakı vaxtı)
+            and m.start > now + timedelta(minutes=MIN_MINUTES_BEFORE_KICKOFF)]
     cands = {}
     for m in pool:
         if STATS_MODE and not (m.info and m.info.get("ok")):
