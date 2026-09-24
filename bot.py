@@ -102,6 +102,7 @@ CREDIT_RESERVE = 5          # Odds API kreditinin bu qədəri həmişə ehtiyatd
 LOW_CREDIT_WARN = 60        # Odds API krediti bundan aşağı düşəndə admin xəbərdar olunur
 RETRY_AFTER_FAIL = 10 * 60  # uğursuz yükləməni 10 dəq. sonra yenidən yoxla
 STATS_RETRY = 15 * 60       # statistika uğursuz olubsa 15 dəq. sonra yenidən yoxla
+MAX_FETCH_TRIES = 3         # natamam baza ən çox bu qədər yenidən yüklənir (kredit büdcəsi daxilində)
 COOLDOWN = 2.0              # eyni istifadəçinin düymə basma fasiləsi (saniyə)
 MIN_MINUTES_BEFORE_KICKOFF = 15  # başlamağa 15 dəq. qalmış oyunları kupona salma
 
@@ -198,7 +199,9 @@ TXT = {
             "🚫 Bu gün {limit}/{limit} kupon kreditiniz bitib.\n\n"
             "Yeni kreditlər sabah, Bakı vaxtı ilə 00:00-dan sonra verilir. 🙌"
         ),
-        "no_matches": "😕 Bu gün üçün statistikası təsdiqlənmiş uyğun oyun tapılmadı. Bir az sonra yenidən yoxla.",
+        "no_matches": "😕 Bu gün üçün uyğun oyun qalmayıb (çoxu artıq başlayıb). Yeni günün oyunları Bakı vaxtı ilə 00:00-dan sonra yüklənir.",
+        "no_matches_stats": "😕 Bu gün üçün statistikası təsdiqlənmiş uyğun oyun tapılmadı. Bir az sonra yenidən yoxla.",
+        "no_tier": "😕 Bu gün «{name}» üçün kifayət qədər uyğun oyun yoxdur. Başqa növü seç və ya bir az sonra yenidən yoxla.",
         "data_error": "⚠️ Oyun məlumatı hazırda alına bilmir. Bir az sonra yenidən yoxla.",
         "quota_out": "⚠️ Bu günün oyun məlumatı limiti bitib. Sabah yenidən yoxla.",
         "gen_error": "⚠️ Xəta baş verdi. Bir az sonra yenidən yoxla.",
@@ -251,6 +254,8 @@ TXT = {
         "a_stats": "📈 Statistika: {v}/{m} oyun təsdiqlənib · API-Football sorğu {c} · qalan {r}{err}",
         "a_stats_off": "📈 Statistika söndürülüb (API_FOOTBALL_KEY yoxdur) — kuponlar yalnız bazar kefinə əsaslanır.",
         "a_limit": "🎟 İstifadəçi limiti: gündə {n} kupon",
+        "a_partial": "⚠️ Baza natamamdır (cəhd {t}/{m}) — bot özü yenidən yoxlayacaq.",
+        "a_credits": "💳 Bu gün Odds API xərci: əsas {o}/{ob} · korner/kart {x}/{xb}",
         "a_snap_none": "⚽ Oyun bazası hələ yüklənməyib.",
         "a_none": "hələ yoxdur",
     },
@@ -289,7 +294,9 @@ TXT = {
             "🚫 You have used all {limit}/{limit} coupon credits for today.\n\n"
             "New credits are given tomorrow after 00:00 Baku time. 🙌"
         ),
-        "no_matches": "😕 No suitable matches with verified stats found for today. Try again a bit later.",
+        "no_matches": "😕 No suitable matches are left for today (most have already started). Tomorrow's games load after 00:00 Baku time.",
+        "no_matches_stats": "😕 No suitable matches with verified stats found for today. Try again a bit later.",
+        "no_tier": "😕 Not enough suitable matches today for the \"{name}\". Pick another type or try again a bit later.",
         "data_error": "⚠️ Match data is unavailable right now. Please try again later.",
         "quota_out": "⚠️ Today's match data limit has been reached. Please try again tomorrow.",
         "gen_error": "⚠️ Something went wrong. Please try again later.",
@@ -339,6 +346,8 @@ TXT = {
         "a_stats": "📈 Stats: {v}/{m} matches verified · API-Football calls {c} · remaining {r}{err}",
         "a_stats_off": "📈 Stats disabled (no API_FOOTBALL_KEY) — coupons rely on market odds only.",
         "a_limit": "🎟 User limit: {n} coupons per day",
+        "a_partial": "⚠️ Match data is incomplete (attempt {t}/{m}) — the bot will retry by itself.",
+        "a_credits": "💳 Odds API spent today: main {o}/{ob} · corners/cards {x}/{xb}",
         "a_snap_none": "⚽ Match database not loaded yet.",
         "a_none": "none yet",
     },
@@ -610,13 +619,15 @@ class Snapshot:
     fb_calls: int = 0          # bu gün API-Football sorğu sayı
     fb_left: object = None     # API-Football qalan gündəlik sorğu
     fb_err: str = ""           # "plan" / "quota" / "auth" / "budget" və ya boş
+    partial: bool = False      # bəzi sorğular uğursuz olub / oyun tapılmayıb → bir az sonra yenidən yoxlanacaq
+    tries: int = 0             # bazanın neçə dəfə yüklənməsi cəhdi
 
     def to_json(self):
         return json.dumps(dict(
             day=self.day, spent=self.spent, remaining=self.remaining,
             leagues=self.leagues, ok=self.ok, extras=self.extras,
             stats_done=self.stats_done, fb_calls=self.fb_calls,
-            fb_left=self.fb_left, fb_err=self.fb_err,
+            fb_left=self.fb_left, fb_err=self.fb_err, partial=self.partial, tries=self.tries,
             matches=[dict(id=m.id, home=m.home, away=m.away, start=m.start.isoformat(),
                           league_key=m.league_key, league=m.league, top=m.top,
                           p3=list(m.p3) if m.p3 else None, info=m.info,
@@ -636,7 +647,8 @@ class Snapshot:
                    for m in d["matches"]]
         return Snapshot(d["day"], matches, d["spent"], d["remaining"], d["leagues"], d["ok"],
                         d.get("extras", False), d.get("stats_done", False),
-                        d.get("fb_calls", 0), d.get("fb_left"), d.get("fb_err", ""))
+                        d.get("fb_calls", 0), d.get("fb_left"), d.get("fb_err", ""),
+                        d.get("partial", False), d.get("tries", 0))
 
 
 def _avg(values):
@@ -735,6 +747,21 @@ def parse_extra_markets(ev):
     return legs
 
 
+def credits_used(kind):
+    """Bu gün (Bakı) Odds API-da xərclənən kredit. kind: "odds" (əsas) və ya "extra" (korner/kart)."""
+    try:
+        return int(kv.hget(f"cr:{datetime.now(TZ).date().isoformat()}", kind) or 0)
+    except Exception:
+        return 0
+
+
+def credits_add(kind, n):
+    try:
+        kv.hincrby(f"cr:{datetime.now(TZ).date().isoformat()}", kind, n)
+    except Exception:
+        log.warning("kredit sayğacı yazılmadı")
+
+
 def _get(path, **params):
     return requests.get(f"{ODDS_BASE}{path}", params={"apiKey": ODDS_API_KEY, **params}, timeout=20)
 
@@ -764,9 +791,10 @@ def league_events(key, t_from, t_to):
         return None
 
 
-def fetch_day():
+def fetch_day(prev=None):
     """
-    Günün oyun bazasını qurur. Addımlar:
+    Günün oyun bazasını qurur (prev: bu günün əvvəlki natamam bazası — artıq alınmış liqalar təkrar alınmır).
+    Addımlar:
       1) aktiv liqaları tap (pulsuz)   2) hansında oyun var — yoxla (pulsuz)
       3) yalnız oyunu olan liqalar üçün kef çək (kredit), gündəlik büdcə daxilində.
     """
@@ -775,15 +803,21 @@ def fetch_day():
     leagues, remaining = discover_leagues()
     with ThreadPoolExecutor(max_workers=8) as ex:
         found = list(ex.map(lambda kt: (kt, league_events(kt[0], now, t_to)), leagues))
+    ev_failed = sum(1 for (k, _t), evs in found if evs is None and k in TOP_LEAGUES)
     active = [(k, t, evs) for (k, t), evs in found if evs]
     # Əvvəl məşhur liqalar, sonra oyun sayı çox olan əlavə liqalar
     active.sort(key=lambda x: (0, TOP_LEAGUES.index(x[0])) if x[0] in TOP_LEAGUES else (1, -len(x[2])))
 
-    matches, spent, quota_out = [], 0, False
+    have = {m.league_key for m in prev.matches} if prev else set()
+    matches = list(prev.matches) if prev else []
+    spent, quota_out, fails = 0, False, 0
+    budget = max(0, DAILY_CREDIT_BUDGET - credits_used("odds"))   # restart/təkrar cəhdlərdən asılı olmayaraq gündəlik tavan
     for key, title, _evs in active:
+        if key in have:
+            continue
         top = key in TOP_LEAGUES
         cost = 2 if top else 1
-        if spent + cost > DAILY_CREDIT_BUDGET:
+        if spent + cost > budget:
             continue
         if remaining is not None and remaining - cost < CREDIT_RESERVE:
             break
@@ -793,6 +827,7 @@ def fetch_day():
                      commenceTimeFrom=_iso(now), commenceTimeTo=_iso(t_to))
         except Exception:
             log.warning("%s | odds sorğusu uğursuz", key)
+            fails += 1
             continue
         rem = r.headers.get("x-requests-remaining")
         if rem is not None:
@@ -805,16 +840,22 @@ def fetch_day():
             quota_out = True
             break
         if r.status_code != 200:
+            fails += 1
             continue
         spent += cost
+        credits_add("odds", cost)
         try:
             matches += parse_league_odds(r.json(), key, title, top, now, t_to)
         except Exception:
             log.exception("%s | parse xətası", key)
     ok = bool(matches) or not quota_out
-    log.info("Baza: %d liqa aktiv, %d oyun, %d kredit xərcləndi, qalan=%s",
-             len(active), len(matches), spent, remaining)
-    return Snapshot(now.date().isoformat(), matches, spent, remaining, len(active), ok)
+    partial = (not matches) or fails > 0 or ev_failed > 0
+    tries = (prev.tries if prev else 0) + 1
+    log.info("Baza: %d liqa aktiv, %d oyun, %d kredit xərcləndi, qalan=%s, uğursuz sorğu=%d, natamam=%s (cəhd %d)",
+             len(active), len(matches), spent, remaining, fails + ev_failed, partial, tries)
+    return Snapshot(now.date().isoformat(), matches, (prev.spent if prev else 0) + spent, remaining,
+                    len(active), ok, extras=prev.extras if prev else False,
+                    partial=partial, tries=tries)
 
 
 def enrich_extras(snap):
@@ -826,15 +867,17 @@ def enrich_extras(snap):
     if snap.extras:
         return
     snap.extras = True   # nəticədən asılı olmayaraq təkrar kredit xərclənməsin
-    if EXTRA_CREDIT_BUDGET < 2:
+    budget = max(0, EXTRA_CREDIT_BUDGET - credits_used("extra"))
+    if budget < 2:
         return
     now = datetime.now(TZ)
     pool = sorted((m for m in snap.matches
-                   if m.top and m.start.date() == now.date() and m.start > now + timedelta(minutes=60)),
+                   if m.top and m.start.date() == now.date() and m.start > now + timedelta(minutes=60)
+                   and not any(l.kind in EXTRA_KINDS for l in m.legs)),
                   key=lambda m: m.start)
     spent, added, remaining = 0, 0, snap.remaining
     for m in pool:
-        if spent + 2 > EXTRA_CREDIT_BUDGET:
+        if spent + 2 > budget:
             break
         if remaining is not None and remaining - 2 < CREDIT_RESERVE:
             break
@@ -862,6 +905,7 @@ def enrich_extras(snap):
         if r.status_code != 200:
             continue
         spent += cost
+        credits_add("extra", cost)
         try:
             legs = parse_extra_markets(r.json())
         except Exception:
@@ -1229,13 +1273,23 @@ def _finish_snapshot(today, data):
         log.exception("Redis snapshot yazılmadı")
 
 
+def _needs_refetch(s):
+    """Uğursuz və ya natamam baza 10 dəq. sonra (ən çox MAX_FETCH_TRIES dəfə) yenidən yüklənir."""
+    d = s["data"]
+    age = time.time() - s["t"]
+    if not s["ok"]:
+        return age >= RETRY_AFTER_FAIL
+    if d.partial and d.tries < MAX_FETCH_TRIES:
+        return age >= RETRY_AFTER_FAIL
+    return False
+
+
 def get_snapshot():
     """Günlük keş. Redis varsa restartdan sonra kredit xərcləmədən oradan oxuyur."""
     today = datetime.now(TZ).date().isoformat()
     with _snap_lock:
         s = _snap
-        if s["day"] == today and s["data"] is not None and (
-                s["ok"] or time.time() - s["t"] < RETRY_AFTER_FAIL):
+        if s["day"] == today and s["data"] is not None and not _needs_refetch(s):
             d = s["data"]
             if s["ok"] and STATS_MODE and not d.stats_done and time.time() - s["st"] > STATS_RETRY:
                 s["st"] = time.time()          # statistika yarımçıq qalıbsa, arabir təkrar cəhd
@@ -1255,8 +1309,9 @@ def get_snapshot():
                     return s["data"], True
             except Exception:
                 log.exception("Redis snapshot oxunmadı")
+        prev = s["data"] if s["day"] == today else None
         try:
-            data = fetch_day()
+            data = fetch_day(prev)
         except Exception:
             log.exception("fetch_day xətası")
             data = None
@@ -1425,7 +1480,9 @@ def build_coupon(matches, tier, variant=0, now=None):
         if opts:
             cands[m.id] = (m, opts)
     ids = list(cands)
-    if len(ids) < 2:
+    log.info("kupon %s | bazada %d oyun, vaxtı uyğun %d, namizəd %d (minimum %d)",
+             tier, len(matches), len(pool), len(ids), cfg["min_legs"])
+    if len(ids) < cfg["min_legs"]:      # növün vəd etdiyi oyun sayından az oyunla kupon verilmir
         return None
     n_top = sum(1 for i in ids if cands[i][0].top)
     choices = {n: w for n, w in cfg["legs"].items() if n <= len(ids)} or {len(ids): 1}
@@ -1459,6 +1516,13 @@ def build_coupon(matches, tier, variant=0, now=None):
     picks, total, prob = result[:3]
     picks = sorted(picks, key=lambda x: x[0].start)
     return Coupon(tier, picks, total, prob, on_target)
+
+
+def count_upcoming(matches, now=None):
+    """Bu gün hələ başlamamış (15 dəq. qalmış çıxmaqla) oyun sayı."""
+    now = now or datetime.now(TZ)
+    return sum(1 for m in matches
+               if m.start.date() == now.date() and m.start > now + timedelta(minutes=MIN_MINUTES_BEFORE_KICKOFF))
 
 
 def _line(leg, default=""):
@@ -1603,6 +1667,10 @@ def format_admin(lang, rep, snap):
         out.append(L["a_snap"].format(m=len(snap.matches), l=snap.leagues, s=snap.spent, r=rem))
         n_x = sum(1 for m in snap.matches if any(l.kind in EXTRA_KINDS for l in m.legs))
         out.append(L["a_snap_x"].format(x=n_x))
+        out.append(L["a_credits"].format(o=credits_used("odds"), ob=DAILY_CREDIT_BUDGET,
+                                         x=credits_used("extra"), xb=EXTRA_CREDIT_BUDGET))
+        if snap.partial:
+            out.append(L["a_partial"].format(t=snap.tries, m=MAX_FETCH_TRIES))
         if STATS_MODE:
             v = sum(1 for m in snap.matches if m.info and m.info.get("ok"))
             err = f" · ⚠️ {snap.fb_err}" if snap.fb_err else ""
@@ -1786,7 +1854,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await alert_admin(context, "⚠️ Kupon botu: Odds API kvotası bitmiş ola bilər.")
                 await status.edit_text(L["quota_out"])
             else:
-                await status.edit_text(L["no_matches"])
+                upcoming = count_upcoming(snap.matches)
+                if upcoming < 2:
+                    txt = L["no_matches_stats"] if STATS_MODE else L["no_matches"]
+                else:
+                    txt = L["no_tier"].format(name=L["name_" + tier])
+                await status.edit_text(txt)
             return
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(L["btn_again"], callback_data=f"c:{tier}:{variant + 1}"),
