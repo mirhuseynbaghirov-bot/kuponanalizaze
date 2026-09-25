@@ -4,7 +4,7 @@ Hazırlayan: Mirhüseyn Bağırov (@Baghirov21)
 
 Mühit dəyişənləri (Render → Environment):
   BOT_TOKEN                 (məcburi) BotFather tokeni
-  ODDS_API_KEY              (məcburi) the-odds-api.com açarı (kefləri verir)
+  ODDS_API_KEY               (məcburi) the-odds-api.com açarı (kefləri verir)
   API_FOOTBALL_KEY          (tövsiyə) api-football.com açarı (REAL komanda statistikası).
                             Qoyulmasa bot yalnız bazar kefinə əsaslanır.
                             DİQQƏT: pulsuz plan cari mövsümü vermir. Belə olsa bot AVTOMATİK
@@ -25,6 +25,7 @@ Mühit dəyişənləri (Render → Environment):
   PROMO_TEXT                (ixtiyari) /about-dakı reklam cümləsi (boşdursa standart mətn)
   SHOW_OWNER_IN_COUPON      (ixtiyari) 1 = kuponun sonunda qurucu sətri göstərilir (default), 0 = gizlət
   BOT_USERNAME              (ixtiyari) avtomatik tapılır; tapılmasa əl ilə yaz (@-siz)
+  FOOTBALL_DATA_ORG_KEY     (tövsiyə) football-data.org PULSUZ token-i (12 əsas liqada statistika)
 
 v4-də nə düzəldilib:
   * Statistika işləmirsə (pulsuz plan, xəta, az oyun) bot avtomatik bazar rejiminə keçir və kuponda bunu yazır.
@@ -36,6 +37,7 @@ v4-də nə düzəldilib:
   * Odds API real xərci (x-requests-last) sayılır; API-Football gündəlik büdcəsi kumulyativdir.
   * Parametr uyğunsuzluğuna davamlılıq (422 olarsa parametrsiz təkrar).
   * /about (qurucu + reklam + paylaşma linki), kuponun sonunda qurucu sətri.
+  * PULSUZ football-data.org inteqrasiyası: 1X2 üçün öz Poisson modelimizlə statistika (12 əsas liqa).
 """
 import asyncio
 import difflib
@@ -641,7 +643,7 @@ class Match:
     top: bool
     legs: list
     p3: object = None    # (ev, heç-heçə, qonaq) bazar ehtimalları
-    info: object = None  # API-Football statistikası (dict) və ya None
+    info: object = None  # statistika (dict) və ya None
 
 
 @dataclass
@@ -707,7 +709,7 @@ def stats_usable(matches, now=None):
     Statistika rejimi real işləyirmi? Yalnız bu günün oyunlarında kifayət qədər təsdiqlənmiş
     statistika varsa (≥8 və ya oyunların yarısı) istifadə olunur. Əks halda bot bazar rejiminə düşür.
     """
-    if not STATS_MODE:
+    if not STATS_MODE and not FD_ORG_MODE:
         return False
     now = now or datetime.now(TZ)
     today = [m for m in matches if m.start.date() == now.date()]
@@ -1020,7 +1022,7 @@ def enrich_extras(snap):
     log.info("Extra: %d oyunda korner/kart xətti tapıldı, %d kredit xərcləndi", added, spent)
 
 
-# ============================== API-FOOTBALL (REAL STATİSTİKA) ==============================
+# ============================== API-FOOTBALL (REAL STATİSTİKA, PULLU) ==============================
 class FootballError(Exception):
     pass
 
@@ -1357,6 +1359,240 @@ def enrich_stats(snap):
              total_ok, len(snap.matches), verified, unmatched, api.calls, api.remaining, api.stopped)
 
 
+# ============================== FOOTBALL-DATA.ORG (PULSUZ STATİSTİKA) ==============================
+# Bu bölmə API-Football-ı əvəz edir: pulsuz plan, 12 əsas liqa, "hazır proqnoz" yoxdur —
+# özümüz Poisson (hücum/müdafiə gücü) modeli ilə 1X2 ehtimalını hesablayırıq.
+# Korner/kart bu mənbədən gəlmir (bunlar hələ də Odds API bazarından, enrich_extras() vasitəsilə gəlir).
+FOOTBALL_ORG_KEY = env("FOOTBALL_DATA_ORG_KEY", "34670f28fa5543728e78c6f683e19009")
+FD_ORG_MODE = bool(FOOTBALL_ORG_KEY)
+FD_ORG_BASE = "https://api.football-data.org/v4"
+FD_ORG_RATE_LIMIT = 10          # sorğu/dəqiqə (pulsuz plan) — avtomatik gözləyərək bu limitə hörmət edilir
+FD_ORG_MIN_GAMES = 4            # komandanın statistikası üçün minimum tapılan (ev/qonaq) oyun
+FD_ORG_LOOKBACK_DAYS = 75       # liqa formasını hesablamaq üçün geriyə neçə gün baxılsın
+FD_ORG_MAX_MATCHES = STATS_MAX_MATCHES
+
+# Odds API liqa açarı → football-data.org competition kodu (YALNIZ pulsuz planda olan liqalar).
+# Diqqət: Türkiyə Süper Liqi və Europa League pulsuz planda YOXDUR — bunlar üçün bot avtomatik
+# yalnız bazar kefinə (Odds API) əsaslanmağa davam edəcək.
+FD_ORG_COMPETITIONS = {
+    "soccer_uefa_champs_league": "CL",
+    "soccer_epl": "PL",
+    "soccer_spain_la_liga": "PD",
+    "soccer_italy_serie_a": "SA",
+    "soccer_germany_bundesliga": "BL1",
+    "soccer_france_ligue_one": "FL1",
+    "soccer_netherlands_eredivisie": "DED",
+    "soccer_portugal_primeira_liga": "PPL",
+}
+
+# /footballorg admin əmri üçün son vəziyyət (proses yaddaşında saxlanır, restartda sıfırlanır)
+_fd_state = {
+    "last_run": None,    # datetime (Bakı) və ya None (hələ heç çağırılmayıb)
+    "ok": False,
+    "error": "",         # "" | "auth" | "quota" | "network" | başqa mətn
+    "verified": 0,       # son işə düşmədə təsdiqlənən oyun
+    "checked": 0,        # son işə düşmədə yoxlanılan oyun
+    "competitions": 0,   # son işə düşmədə yoxlanılan liqa sayı
+}
+
+
+class FootballOrgError(Exception):
+    pass
+
+
+class FootballOrgAPI:
+    """
+    football-data.org v4 klienti. Pulsuz plan: 10 sorğu/dəqiqə — burda avtomatik "throttle"
+    (lazım olanda gözləyir) ilə həll olunur, əl ilə idarə etməyə ehtiyac yoxdur.
+    """
+
+    def __init__(self, key):
+        self.key = key
+        self.calls = 0
+        self._times = []
+        self.stopped = ""   # "" | "auth" | "quota" | "network"
+
+    def _throttle(self):
+        now = time.time()
+        self._times = [t for t in self._times if now - t < 60]
+        if len(self._times) >= FD_ORG_RATE_LIMIT:
+            wait = 60 - (now - self._times[0]) + 0.5
+            if wait > 0:
+                time.sleep(wait)
+        self._times.append(time.time())
+
+    def get(self, path, **params):
+        if self.stopped:
+            raise FootballOrgError(self.stopped)
+        self._throttle()
+        self.calls += 1
+        try:
+            r = requests.get(FD_ORG_BASE + path, headers={"X-Auth-Token": self.key},
+                             params=params, timeout=20)
+        except Exception as e:
+            self.stopped = "network"
+            raise FootballOrgError(str(e)) from e
+        if r.status_code == 429:              # dəqiqəlik limit — bir dəfə gözləyib təkrar cəhd
+            time.sleep(15)
+            try:
+                r = requests.get(FD_ORG_BASE + path, headers={"X-Auth-Token": self.key},
+                                 params=params, timeout=20)
+            except Exception as e:
+                self.stopped = "network"
+                raise FootballOrgError(str(e)) from e
+        if r.status_code in (401, 403):
+            self.stopped = "auth"
+            raise FootballOrgError("auth")
+        if r.status_code == 429:
+            self.stopped = "quota"
+            raise FootballOrgError("quota")
+        if r.status_code != 200:
+            raise FootballOrgError(f"http {r.status_code}")
+        return r.json()
+
+
+def _fd_league_matches(api, comp_code, day):
+    """Liqanın son ~75 günlük bitmiş matçları. Gündə 1 dəfə çəkilir, Redis-də keşlənir."""
+    key = f"fdorg:matches:{comp_code}:{day}"
+    cached = _kvj_get(key)
+    if cached is not None:
+        return cached
+    date_from = (datetime.now(TZ).date() - timedelta(days=FD_ORG_LOOKBACK_DAYS)).isoformat()
+    date_to = datetime.now(TZ).date().isoformat()
+    data = api.get(f"/competitions/{comp_code}/matches", status="FINISHED",
+                   dateFrom=date_from, dateTo=date_to)
+    matches = data.get("matches", [])
+    _kvj_set(key, matches, ex=12 * 3600)
+    return matches
+
+
+def _fd_team_appearances(matches, team_name, side, limit=PROFILE_GAMES):
+    """Komandanın (ad üzrə uyğunlaşdırılmış) son `limit` evdə/çöldə oyunundakı (vurduğu, buraxdığı) qol cütləri."""
+    rows = []
+    for mt in sorted(matches, key=lambda x: x.get("utcDate", ""), reverse=True):
+        score = (mt.get("score") or {}).get("fullTime") or {}
+        hg, ag = score.get("home"), score.get("away")
+        if hg is None or ag is None:
+            continue
+        home_name = (mt.get("homeTeam") or {}).get("name") or ""
+        away_name = (mt.get("awayTeam") or {}).get("name") or ""
+        if side == "home" and name_score(team_name, home_name) >= 0.85:
+            rows.append((hg, ag))
+        elif side == "away" and name_score(team_name, away_name) >= 0.85:
+            rows.append((ag, hg))
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _fd_league_averages(matches):
+    """Liqanın ev/qonaq orta qol ortalaması (Poisson modeli üçün baza xətt)."""
+    hs = as_ = n = 0
+    for mt in matches:
+        score = (mt.get("score") or {}).get("fullTime") or {}
+        hg, ag = score.get("home"), score.get("away")
+        if hg is None or ag is None:
+            continue
+        hs += hg
+        as_ += ag
+        n += 1
+    if n < 10:
+        return 1.5, 1.2   # kifayət qədər data yoxdursa Avropa liqalarının tipik ortalaması
+    return hs / n, as_ / n
+
+
+def _poisson(k, lam):
+    return math.exp(-lam) * lam ** k / math.factorial(k)
+
+
+def _fd_match_probs(exp_home, exp_away, max_goals=6):
+    """Gözlənilən qollardan (Poisson) 1X2 ehtimalını hesablayır."""
+    ph = [_poisson(i, exp_home) for i in range(max_goals + 1)]
+    pa = [_poisson(i, exp_away) for i in range(max_goals + 1)]
+    p_home = p_draw = p_away = 0.0
+    for i in range(max_goals + 1):
+        for j in range(max_goals + 1):
+            p = ph[i] * pa[j]
+            if i > j:
+                p_home += p
+            elif i == j:
+                p_draw += p
+            else:
+                p_away += p
+    tot = p_home + p_draw + p_away
+    if tot <= 0:
+        return 1 / 3, 1 / 3, 1 / 3
+    return p_home / tot, p_draw / tot, p_away / tot
+
+
+def build_fd_info(m, matches, avg_h, avg_a):
+    """
+    Bir Odds API matçı üçün football-data.org xammalından statistika paketi qurur.
+    Format API-Football-un parse_prediction() nəticəsi ilə eynidir ki, stat_gate()/note_text()
+    heç bir dəyişiklik olmadan işləsin. cor/crd=None (bu mənbədə korner/kart yoxdur).
+    """
+    h_home = _fd_team_appearances(matches, m.home, "home")
+    a_away = _fd_team_appearances(matches, m.away, "away")
+    if len(h_home) < FD_ORG_MIN_GAMES or len(a_away) < FD_ORG_MIN_GAMES:
+        return None
+    h_scored, h_conceded = _avg([g for g, _ in h_home]), _avg([c for _, c in h_home])
+    a_scored, a_conceded = _avg([g for g, _ in a_away]), _avg([c for _, c in a_away])
+    attack_h = h_scored / avg_h if avg_h else 1.0
+    def_h = h_conceded / avg_a if avg_a else 1.0
+    attack_a = a_scored / avg_a if avg_a else 1.0
+    def_a = a_conceded / avg_h if avg_h else 1.0
+    exp_home = attack_h * def_a * avg_h
+    exp_away = attack_a * def_h * avg_a
+    ph, pd, pa = _fd_match_probs(exp_home, exp_away)
+
+    def form_str(rows):
+        s = "".join("W" if g > c else ("D" if g == c else "L") for g, c in rows[:5])
+        return s[::-1]   # ən köhnədən ən yeniyə doğru (s_form/note_text bu sıra ilə göstərir)
+
+    return {"ok": True, "pct": [ph, pd, pa], "form": [form_str(h_home), form_str(a_away)],
+            "g": [h_scored, h_conceded, a_scored, a_conceded], "h2h": [0, 0, 0, 0],
+            "cor": None, "crd": None}
+
+
+def enrich_stats_fdorg(snap):
+    """
+    football-data.org əsasında pulsuz statistika. Yalnız FD_ORG_COMPETITIONS-dəki liqalarda və
+    hələ təsdiqlənməmiş oyunlarda işləyir. Nəticə _fd_state-ə yazılır ki, /footballorg admin
+    əmri ilə vəziyyət yoxlana bilsin.
+    """
+    if not FD_ORG_MODE:
+        return
+    day = datetime.now(TZ).date().isoformat()
+    now = datetime.now(TZ)
+    api = FootballOrgAPI(FOOTBALL_ORG_KEY)
+    cand = [m for m in snap.matches
+            if m.start.date() == now.date() and not _verified(m)
+            and m.league_key in FD_ORG_COMPETITIONS][:FD_ORG_MAX_MATCHES]
+    comps = sorted({m.league_key for m in cand})
+    verified = checked = 0
+    error = ""
+    for league_key in comps:
+        code = FD_ORG_COMPETITIONS[league_key]
+        try:
+            league_matches = _fd_league_matches(api, code, day)
+        except FootballOrgError as e:
+            error = str(e) or "network"
+            if api.stopped:
+                break
+            continue
+        avg_h, avg_a = _fd_league_averages(league_matches)
+        for m in (x for x in cand if x.league_key == league_key):
+            checked += 1
+            info = build_fd_info(m, league_matches, avg_h, avg_a)
+            if info:
+                m.info = info
+                verified += 1
+    _fd_state.update(last_run=now, ok=(verified > 0 or (error == "" and checked == 0)),
+                     error=error, verified=verified, checked=checked, competitions=len(comps))
+    log.info("football-data.org: %d/%d oyun təsdiqləndi, %d liqa yoxlanıldı, %d sorğu, xəta=%s",
+             verified, checked, len(comps), api.calls, error or "-")
+
+
 # ============================== BAZA İDARƏSİ (KEŞ + FON) ==============================
 _snap = {"day": None, "t": 0.0, "st": 0.0, "data": None, "ok": False}
 _snap_lock = threading.Lock()
@@ -1374,7 +1610,13 @@ class _Building:
 
 
 def _finish_snapshot(today, data):
-    """Statistika mərhələsi (əvvəl), sonra korner/kart mərhələsi, sonra Redis-ə yazır."""
+    """Statistika mərhələsi (əvvəl football-data.org — pulsuz, sonra API-Football əgər açardırsa),
+    sonra korner/kart mərhələsi, sonra Redis-ə yazır."""
+    if FD_ORG_MODE:
+        try:
+            enrich_stats_fdorg(data)
+        except Exception:
+            log.exception("enrich_stats_fdorg xətası")
     if STATS_MODE and not data.stats_done:
         try:
             enrich_stats(data)
@@ -1514,7 +1756,7 @@ def stat_gate(m, leg, mode="strict"):
     Statistikası olmayan oyun və ya kifayət qədər məlumat yoxdursa False (yəni pick verilmir).
     mode: "strict" və ya "relaxed" (bax GATES).
     """
-    if not STATS_MODE:
+    if not STATS_MODE and not FD_ORG_MODE:
         return True
     info = m.info
     if not info or not info.get("ok"):
@@ -1547,7 +1789,11 @@ def stat_gate(m, leg, mode="strict"):
     if k in EXTRA_KINDS:
         key = "cor" if k.startswith("corners") else "crd"
         e = expect_pair(info, key)
-        if e is None or leg.line is None:
+        if e is None:
+            # Bu mənbədə (məs. football-data.org) korner/kart statistikası yoxdur — statistika
+            # yoxluğuna görə pick-i rədd etmə, Odds API bazar kefinə etibar et.
+            return True
+        if leg.line is None:
             return False
         tot = e[0] + e[1]
         margin = g["corner_margin"] if key == "cor" else g["card_margin"]
@@ -1746,8 +1992,8 @@ def pick_text(L, m, leg):
 
 def note_text(L, m, leg):
     """
-    Analiz qeydi. Statistika varsa: rəqəmlər birbaşa API-Football məlumatından hesablanır.
-    Statistika yoxdursa: yalnız bazar ehtimalı, ehtimal həddindən yuxarı olanda.
+    Analiz qeydi. Statistika varsa: rəqəmlər birbaşa mənbə (API-Football/football-data.org)
+    məlumatından hesablanır. Statistika yoxdursa: yalnız bazar ehtimalı, ehtimal həddindən yuxarı olanda.
     """
     k = leg.kind
     info = m.info if _verified(m) else None
@@ -1826,7 +2072,7 @@ def format_coupon(lang, c, now=None, left=None, limit=None):
         lines.append(L["extra_note"])
     if c.stats_used and any(i in notes and _verified(c.picks[i][0]) for i in range(len(c.picks))):
         lines.append(L["stats_note"])
-    if STATS_MODE and not c.stats_used:
+    if (STATS_MODE or FD_ORG_MODE) and not c.stats_used:
         lines.append(L["fb_note"])
     lines.append("")
     lines.append(L["disclaimer"])
@@ -1881,9 +2127,16 @@ def format_admin(lang, rep, snap):
             out.append(L["a_stats"].format(v=v, m=len(snap.matches), c=snap.fb_calls, r=fl, err=err))
             if not stats_usable(snap.matches):
                 out.append(L["a_stats_fb"])
+        if FD_ORG_MODE:
+            fs = _fd_state
+            when = fs["last_run"].strftime("%H:%M") if fs["last_run"] else "—"
+            status = "✅" if (fs["ok"] and not fs["error"]) else "⚠️"
+            out.append(f"{status} football-data.org: {fs['verified']}/{fs['checked']} oyun ({fs['competitions']} liqa) "
+                       f"· son yoxlama {when}" + (f" · xəta: {fs['error']}" if fs["error"] else "")
+                       + " · ətraflı: /footballorg")
     else:
         out.append(L["a_snap_none"])
-    if not STATS_MODE:
+    if not STATS_MODE and not FD_ORG_MODE:
         out.append(L["a_stats_off"])
     out.append(L["a_limit"].format(n=USER_DAILY_LIMIT))
     out.append(L["a_mem_ok"] if rep["persistent"] else L["a_mem_tmp"])
@@ -2022,6 +2275,56 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(L["r_done"].format(m=len(d.matches), l=d.leagues, f=d.fails, r=rem, lg=lg))
 
 
+async def cmd_footballorg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: football-data.org statistika mənbəyinin cari vəziyyətini göstərir."""
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return
+    if not FD_ORG_MODE:
+        await update.message.reply_text(
+            "⚠️ football-data.org söndürülüb — FOOTBALL_DATA_ORG_KEY təyin edilməyib (Render → Environment)."
+        )
+        return
+    s = _fd_state
+    if s["last_run"] is None:
+        await update.message.reply_text(
+            "⏳ football-data.org hələ heç çağırılmayıb — baza hələ fonda hazırlanır. "
+            "Bir neçə dəqiqə sonra yenidən /footballorg yaz, ya da /yenile ilə dərhal yenilə."
+        )
+        return
+    when = s["last_run"].strftime("%H:%M")
+    comps = ", ".join(sorted(FD_ORG_COMPETITIONS)) or "—"
+    if s["ok"] and not s["error"]:
+        if s["checked"] == 0:
+            text = (
+                "✅ football-data.org əlaqəsi qaydasındadır, amma bu gün pulsuz plandakı "
+                "liqalarda (Champions League, Premier League, La Liga, Bundesliga, Serie A, "
+                "Ligue 1, Eredivisie, Primeira Liga) hələ yoxlanılacaq oyun yoxdur.\n\n"
+                f"🕒 Son yoxlama: {when}"
+            )
+        else:
+            text = (
+                "✅ football-data.org vasitəsilə statistika uğurla çəkilməyə davam edir...\n\n"
+                f"🕒 Son yoxlama: {when}\n"
+                f"⚽ Yoxlanılan liqa sayı: {s['competitions']}\n"
+                f"📊 Statistikası təsdiqlənən oyun: {s['verified']}/{s['checked']}"
+            )
+    else:
+        err_map = {
+            "auth": "token səhvdir — FOOTBALL_DATA_ORG_KEY-i yoxla",
+            "quota": "sorğu limiti bitib (10/dəqiqə pulsuz plan) — bir az sonra özü düzələcək",
+            "network": "şəbəkə xətası — bir az sonra özü yenidən cəhd edəcək",
+        }
+        text = (
+            "⚠️ football-data.org-dan statistika hazırda alınmır.\n\n"
+            f"🕒 Son cəhd: {when}\n"
+            f"❌ Səbəb: {err_map.get(s['error'], s['error'] or 'naməlum xəta')}\n"
+            f"📊 Bu cəhddə təsdiqlənən: {s['verified']}/{s['checked']}"
+        )
+    text += f"\n\n📋 İzlənən liqalar: {comps}"
+    await update.message.reply_text(text)
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -2103,7 +2406,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 upcoming = count_upcoming(snap.matches)
                 if upcoming < 2:
-                    txt = L["no_matches_stats"] if STATS_MODE else L["no_matches"]
+                    txt = L["no_matches_stats"] if (STATS_MODE or FD_ORG_MODE) else L["no_matches"]
                 else:
                     txt = L["no_tier"].format(name=L["name_" + tier])
                 await status.edit_text(txt)
@@ -2204,8 +2507,9 @@ def keep_alive():
 
 
 def main():
-    log.info("Statistika rejimi: %s | istifadəçi limiti: %s/gün | Odds büdcə: %s+%s/gün | qurucu: %s %s",
-             "AÇIQ (API-Football)" if STATS_MODE else "SÖNDÜRÜLÜB (yalnız bazar kefi)",
+    log.info("Statistika mənbələri: API-Football=%s | football-data.org=%s | istifadəçi limiti: %s/gün | "
+             "Odds büdcə: %s+%s/gün | qurucu: %s %s",
+             "AÇIQ" if STATS_MODE else "SÖNDÜRÜLÜB", "AÇIQ (pulsuz)" if FD_ORG_MODE else "SÖNDÜRÜLÜB",
              USER_DAILY_LIMIT or "limitsiz", DAILY_CREDIT_BUDGET, EXTRA_CREDIT_BUDGET,
              OWNER_NAME, OWNER_HANDLE)
     if (DAILY_CREDIT_BUDGET + EXTRA_CREDIT_BUDGET) * 31 > 500:
@@ -2225,6 +2529,7 @@ def main():
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler(["yenile", "refresh"], cmd_refresh))
+    app.add_handler(CommandHandler("footballorg", cmd_footballorg))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
     # drop_pending_updates: restartda köhnə yığılmış mesajlara cavab yağdırmasın
