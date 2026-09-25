@@ -38,6 +38,8 @@ v4-də nə düzəldilib:
   * Parametr uyğunsuzluğuna davamlılıq (422 olarsa parametrsiz təkrar).
   * /about (qurucu + reklam + paylaşma linki), kuponun sonunda qurucu sətri.
   * PULSUZ football-data.org inteqrasiyası: 1X2 üçün öz Poisson modelimizlə statistika (12 əsas liqa).
+  * DÜZƏLİŞ: pick seçimi yenidən EHTİMALA görə aparılır (kef hədəfə yaxınlıq ikinci dərəcəli meyardır) ki,
+    eyni oyun üçün "Başqa variant" bir-birinə zidd pick (bir dəfə 1X, bir dəfə X2) verməsin.
 """
 import asyncio
 import difflib
@@ -1843,10 +1845,13 @@ def _search(rng, cands, ids, n, cfg, cap, t0, level, tries=400):
             if not opts:     # bu oyun üçün uyğun variant qalmadı → kombinasiya keçərsiz
                 bad = True
                 break
-            # əsas marketlərə üstünlük: təxmini kef +0.10, korner/kart +0.04 cərimə
-            leg = min(opts, key=lambda l: abs(math.log(l.odds) - math.log(target))
-                      + (0.10 if l.approx else (0.04 if l.kind in EXTRA_KINDS else 0.0))
-                      + rng.uniform(0, 0.06))
+            # ən çox EHTİMALLI variant seçilir (məsələn 1X vs X2-dən daha yəqin olan), kef hədəfə
+            # yaxınlıq yalnız ikinci dərəcəli meyardır — beləcə eyni oyun üçün "Başqa variant"
+            # bir-birinə zidd (bir dəfə 1X, bir dəfə X2) tövsiyə vermir
+            leg = max(opts, key=lambda l: l.prob
+                      - 0.15 * abs(math.log(l.odds) - math.log(target))
+                      - (0.05 if l.approx else (0.02 if l.kind in EXTRA_KINDS else 0.0))
+                      + rng.uniform(0, 0.01))
             kinds[leg.kind] += 1
             picks.append((m, leg))
         if bad:
