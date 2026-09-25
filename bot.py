@@ -291,6 +291,17 @@ TXT = {
         "a_credits": "💳 Bu gün Odds API xərci: əsas {o}/{ob} · korner/kart {x}/{xb}",
         "a_snap_none": "⚽ Oyun bazası hələ yüklənməyib.",
         "a_none": "hələ yoxdur",
+        # nəticə izləmə (settlement)
+        "stat_title": "📊 Son {n} gün — tutma faizi (şəffaflıq üçün)",
+        "stat_row": "{icon} {name}: {pct}% ({settled} kupon)",
+        "stat_empty": "📊 Statistika hələ toplanır — kifayət qədər tamamlanmış kupon yoxdur. Bir neçə gün sonra yenidən yoxla.",
+        "stat_footer": "\n⚠️ Keçmiş nəticələr gələcək uğuru zəmanət etmir. 18+ · Məsuliyyətlə oyna.",
+        "my_title": "🎫 Son {n} gün kupon tarixçən: {total} kupon",
+        "my_row": "✅ {w} tutub · ❌ {l} tutmayıb · ⏳ {p} gözlənilir",
+        "my_empty": "Hələ kupon tarixçən yoxdur — /gununoyunlari ilə ilk kuponunu al.",
+        "s_win": "tutub",
+        "s_loss": "tutmayıb",
+        "s_pending": "gözlənilir",
     },
     "en": {
         "welcome": (
@@ -392,14 +403,26 @@ TXT = {
         "a_credits": "💳 Odds API spent today: main {o}/{ob} · corners/cards {x}/{xb}",
         "a_snap_none": "⚽ Match database not loaded yet.",
         "a_none": "none yet",
+        "stat_title": "📊 Last {n} days — hit rate (for transparency)",
+        "stat_row": "{icon} {name}: {pct}% ({settled} coupons)",
+        "stat_empty": "📊 Statistics are still being collected — not enough settled coupons yet. Check back in a few days.",
+        "stat_footer": "\n⚠️ Past results don't guarantee future results. 18+ · Bet responsibly.",
+        "my_title": "🎫 Your coupon history, last {n} days: {total} coupons",
+        "my_row": "✅ {w} hit · ❌ {l} missed · ⏳ {p} pending",
+        "my_empty": "You don't have any coupon history yet — get your first with /coupon.",
+        "s_win": "hit",
+        "s_loss": "missed",
+        "s_pending": "pending",
     },
 }
 LANG_BUTTONS = [("az", "🇦🇿 Azərbaycanca"), ("en", "🇬🇧 English")]
 COMMANDS = {
-    "az": [("start", "Başla"), ("gununoyunlari", "Günün kuponu"),
-           ("lang", "Dil / Language"), ("about", "Bot haqqında"), ("privacy", "Məxfilik")],
-    "en": [("start", "Start"), ("coupon", "Today's coupon"),
-           ("lang", "Language"), ("about", "About the bot"), ("privacy", "Privacy")],
+    "az": [("start", "Başla"), ("gununoyunlari", "Günün kuponu"), ("kuponlarim", "Kupon tarixçəm"),
+           ("statistika", "Tutma statistikası"), ("lang", "Dil / Language"),
+           ("about", "Bot haqqında"), ("privacy", "Məxfilik")],
+    "en": [("start", "Start"), ("coupon", "Today's coupon"), ("mycoupons", "My coupon history"),
+           ("statistika", "Hit-rate stats"), ("lang", "Language"),
+           ("about", "About the bot"), ("privacy", "Privacy")],
 }
 
 
@@ -1803,6 +1826,260 @@ def stat_gate(m, leg, mode="strict"):
     return False
 
 
+# ============================== NƏTİCƏ İZLƏMƏ (SETTLEMENT) ==============================
+# Hər verilən kupon Redis-də saxlanılır, sonra real nəticələrlə (Odds API-nin PULSUZ
+# /scores endpoint-i + korner/kart üçün API-Football) yoxlanılır. Bu, həm admin panelində
+# ("bu kuponlardan hansı tutub") istifadə olunur, həm də istifadəçilərə şəffaflıq üçün
+# (/statistika, /kuponlarim) göstərilir.
+SETTLE_LOOP_EVERY = 30 * 60     # nəticə yoxlama dövrü
+SETTLE_BACK_DAYS = 3            # son neçə günün kuponları yoxlanılsın (gecikmiş nəticələr üçün)
+SETTLE_FOOTBALL_BUDGET = 60     # korner/kart nəticəsi üçün gündə maksimum API-Football sorğu
+
+
+def _coupon_id():
+    return f"{int(time.time() * 1000)}{random.randint(100, 999)}"
+
+
+def record_coupon_for_settlement(coupon, uid):
+    """Verilən kuponu (tier + hər pick-in event id/kind/line) Redis-ə yazır ki, sonra
+    real nəticə ilə yoxlanıla bilsin. Xəta olsa belə istifadəçiyə təsir etməməlidir."""
+    day = datetime.now(TZ).date().isoformat()
+    cid = _coupon_id()
+    payload = {
+        "uid": uid,
+        "tier": coupon.tier,
+        "total": coupon.total,
+        "picks": [
+            {"event_id": m.id, "sport": m.league_key, "home": m.home, "away": m.away,
+             "start": m.start.isoformat(), "kind": leg.kind, "line": leg.line, "odds": leg.odds}
+            for m, leg in coupon.picks
+        ],
+    }
+    try:
+        kv.hset(f"cp:{day}", cid, json.dumps(payload))
+    except Exception:
+        log.warning("kupon settlement üçün yazılmadı")
+
+
+def fetch_scores(sport_key, days_from=3):
+    """Odds API-nin PULSUZ /scores endpoint-i: bitmiş oyunların hesabı. Kredit çəkmir."""
+    try:
+        r = _get(f"/sports/{sport_key}/scores", daysFrom=days_from)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        log.warning("%s | scores sorğusu uğursuz", sport_key)
+        return None
+
+
+def _parse_score_entry(ev):
+    if not ev.get("completed"):
+        return None
+    sm = {s.get("name"): s.get("score") for s in (ev.get("scores") or [])}
+    hs, as_ = sm.get(ev.get("home_team")), sm.get(ev.get("away_team"))
+    try:
+        return int(hs), int(as_)
+    except (TypeError, ValueError):
+        return None
+
+
+def _settle_h2h_goal_leg(kind, hs, as_):
+    """1X2/ikiqat şans/2.5 üst-alt pick-i real hesaba görə tutub-tutmadığını qaytarır."""
+    if kind == "home":
+        return hs > as_
+    if kind == "away":
+        return as_ > hs
+    if kind == "dc1x":
+        return hs >= as_
+    if kind == "dcx2":
+        return as_ >= hs
+    if kind == "dc12":
+        return hs != as_
+    if kind == "over":
+        return (hs + as_) > 2.5
+    if kind == "under":
+        return (hs + as_) < 2.5
+    return None
+
+
+def find_finished_fixture(home, away, start_ts, fixtures, used):
+    """find_fixture-in bitmiş oyunlar üçün variantı (status FINISHED, daha geniş vaxt pəncərəsi)."""
+    best, best_sc = None, 0.0
+    for f in fixtures:
+        fx = f.get("fixture") or {}
+        fid = fx.get("id")
+        if fid is None or fid in used:
+            continue
+        if (fx.get("status") or {}).get("short") not in FINISHED:
+            continue
+        if abs((fx.get("timestamp") or 0) - start_ts) > 4 * 3600:
+            continue
+        teams = f.get("teams") or {}
+        sh = name_score(home, (teams.get("home") or {}).get("name", ""))
+        sa = name_score(away, (teams.get("away") or {}).get("name", ""))
+        if min(sh, sa) < 0.85 or sh + sa < 1.8:
+            continue
+        if sh + sa > best_sc:
+            best, best_sc = f, sh + sa
+    return best
+
+
+def _settle_extra_leg(api, pick, fixtures_cache, used_cache):
+    """Korner/kart pick-i API-Football vasitəsilə yoxlayır (yalnız STATS_MODE aktivdirsə)."""
+    try:
+        start_dt = datetime.fromisoformat(pick["start"]).astimezone(TZ)
+    except ValueError:
+        return None
+    day_str = start_dt.date().isoformat()
+    if day_str not in fixtures_cache:
+        try:
+            fixtures_cache[day_str] = api.get("/fixtures", date=day_str, timezone="Asia/Baku")
+        except FootballError:
+            fixtures_cache[day_str] = []
+    used = used_cache.setdefault(day_str, set())
+    fx = find_finished_fixture(pick["home"], pick["away"], start_dt.timestamp(),
+                               fixtures_cache[day_str], used)
+    if not fx:
+        return None
+    try:
+        resp = api.get("/fixtures/statistics", fixture=fx["fixture"]["id"])
+    except FootballError:
+        return None
+    s = parse_fixture_stats({"teams": fx.get("teams"), "statistics": resp}, fx["fixture"]["id"])
+    if not s:
+        return None
+    used.add(fx["fixture"]["id"])
+    total = (s["hc"] + s["ac"]) if pick["kind"].startswith("corners") else (s["hk"] + s["ak"])
+    line = pick.get("line")
+    if line is None:
+        return None
+    return total > line if pick["kind"].endswith("over") else total < line
+
+
+def settle_day(day):
+    """
+    Bir günün bütün saxlanılmış kuponlarını real nəticələrlə yoxlayır. Kupon "win" sayılır
+    yalnız BÜTÜN pick-lər tutubsa (akkumulyator məntiqi). Naməlum qalan pick varsa (nəticə
+    mənbəyi tapılmayıb) kupon "unknown" sayılır və faizə qatılmır — səhv statistika verməkdənsə
+    bilinməyəni bilinməyən kimi saxlamaq daha doğrudur.
+    """
+    try:
+        raw = kv.hgetall(f"cp:{day}")
+        already = set(kv.hgetall(f"cpres:{day}").keys())
+    except Exception:
+        log.exception("settle_day: oxuma xətası")
+        return
+    if not raw:
+        return
+    pending = {}
+    for cid, v in raw.items():
+        if cid in already:
+            continue
+        try:
+            pending[cid] = json.loads(v)
+        except Exception:
+            continue
+    if not pending:
+        return
+
+    sports = {p["sport"] for c in pending.values() for p in c["picks"]}
+    score_map = {}
+    for sp in sports:
+        data = fetch_scores(sp, days_from=min(SETTLE_BACK_DAYS + 1, 3))
+        if not data:
+            continue
+        for ev in data:
+            sc = _parse_score_entry(ev)
+            if sc:
+                score_map[ev["id"]] = sc
+
+    api = FootballAPI(FOOTBALL_KEY, SETTLE_FOOTBALL_BUDGET) if STATS_MODE else None
+    fixtures_cache, used_cache = {}, {}
+
+    settled_n = 0
+    for cid, c in pending.items():
+        results = []
+        for p in c["picks"]:
+            if p["kind"] in EXTRA_KINDS:
+                if api is None or api.stopped:
+                    results.append(None)
+                    continue
+                try:
+                    results.append(_settle_extra_leg(api, p, fixtures_cache, used_cache))
+                except Exception:
+                    results.append(None)
+            else:
+                sc = score_map.get(p["event_id"])
+                results.append(_settle_h2h_goal_leg(p["kind"], *sc) if sc else None)
+        if any(r is None for r in results):
+            status = "unknown"
+        elif all(results):
+            status = "win"
+        else:
+            status = "loss"
+        try:
+            kv.hset(f"cpres:{day}", cid, status)
+            kv.hincrby(f"tierres:{day}:{c['tier']}", status, 1)
+            settled_n += 1
+        except Exception:
+            log.warning("settlement yazılmadı: %s", cid)
+    if settled_n:
+        log.info("settle_day %s: %d/%d kupon yoxlanıldı", day, settled_n, len(pending))
+
+
+def settlement_report(ndays=30):
+    """Tier üzrə son ndays günün win/loss/unknown cəmini qaytarır."""
+    today = datetime.now(TZ).date()
+    per_tier = {t: {"win": 0, "loss": 0, "unknown": 0} for t in TIERS}
+    for i in range(ndays):
+        day = (today - timedelta(days=i)).isoformat()
+        for tier in TIERS:
+            try:
+                h = kv.hgetall(f"tierres:{day}:{tier}")
+            except Exception:
+                h = {}
+            for k in ("win", "loss", "unknown"):
+                per_tier[tier][k] += int(h.get(k, 0))
+    return per_tier
+
+
+def my_coupon_history(uid, ndays=14):
+    """İstifadəçinin son ndays gündəki kuponları: (day, tier, status)."""
+    today = datetime.now(TZ).date()
+    rows = []
+    for i in range(ndays):
+        day = (today - timedelta(days=i)).isoformat()
+        try:
+            cp = kv.hgetall(f"cp:{day}")
+            res = kv.hgetall(f"cpres:{day}")
+        except Exception:
+            continue
+        for cid, raw in cp.items():
+            try:
+                c = json.loads(raw)
+            except Exception:
+                continue
+            if c.get("uid") != uid:
+                continue
+            rows.append((day, c["tier"], res.get(cid, "gözlənilir")))
+    return rows
+
+
+async def settle_loop():
+    """Fonda: hər SETTLE_LOOP_EVERY dövründə son bir neçə günün kuponlarını yoxlayır."""
+    await asyncio.sleep(45)
+    while True:
+        try:
+            now = datetime.now(TZ)
+            for back in range(1, SETTLE_BACK_DAYS + 1):
+                day = (now.date() - timedelta(days=back)).isoformat()
+                await asyncio.to_thread(settle_day, day)
+        except Exception:
+            log.exception("settle_loop xətası")
+        await asyncio.sleep(SETTLE_LOOP_EVERY)
+
+
 # ============================== KUPON ALQORİTMİ ==============================
 @dataclass
 class Coupon:
@@ -2330,6 +2607,82 @@ async def cmd_footballorg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def cmd_statistika(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Hamıya açıq: son 30 günün tier üzrə tutma faizi (şəffaflıq/etibar üçün, şəxsi məlumat yoxdur)."""
+    lang = await user_lang(update.effective_user)
+    L = T(lang)
+    ndays = 30
+    rep = await safe_call(settlement_report, ndays)
+    if not rep or not any(v["win"] + v["loss"] for v in rep.values()):
+        await update.message.reply_text(L["stat_empty"])
+        return
+    lines = [L["stat_title"].format(n=ndays)]
+    for tier, cfg in TIERS.items():
+        w, l = rep[tier]["win"], rep[tier]["loss"]
+        settled = w + l
+        if settled == 0:
+            continue
+        pct = round(100 * w / settled)
+        lines.append(L["stat_row"].format(icon=cfg["icon"], name=L["name_" + tier],
+                                          pct=pct, settled=settled))
+    lines.append(L["stat_footer"])
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_mycoupons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """İstifadəçinin öz kupon tarixçəsi + şəxsi tutma faizi (son 14 gün)."""
+    user = update.effective_user
+    lang = await user_lang(user)
+    L = T(lang)
+    ndays = 14
+    rows = await safe_call(my_coupon_history, user.id, ndays)
+    if not rows:
+        await update.message.reply_text(L["my_empty"])
+        return
+    w = sum(1 for _, _, s in rows if s == "win")
+    l = sum(1 for _, _, s in rows if s == "loss")
+    p = sum(1 for _, _, s in rows if s not in ("win", "loss"))
+    lines = [L["my_title"].format(n=ndays, total=len(rows)),
+             L["my_row"].format(w=w, l=l, p=p)]
+    for day, tier, status in sorted(rows, reverse=True)[:10]:
+        mark = {"win": "✅", "loss": "❌"}.get(status, "⏳")
+        cfg = TIERS[tier]
+        lines.append(f"{mark} {day} · {cfg['icon']} {L['name_' + tier]}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_netice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: detallı nəticə statistikası (tier üzrə tutma faizi, sınmış/naməlum sayı)."""
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return
+    ndays = 30
+    if context.args and context.args[0].isdigit():
+        ndays = max(1, min(int(context.args[0]), 90))
+    rep = await safe_call(settlement_report, ndays)
+    if rep is None:
+        await update.message.reply_text("⚠️ Nəticə statistikası oxunmadı. Render Logs-a bax.")
+        return
+    lines = [f"📊 Son {ndays} gün — kupon nəticələri (admin)"]
+    tot_w = tot_l = tot_u = 0
+    for tier, cfg in TIERS.items():
+        w, l, u = rep[tier]["win"], rep[tier]["loss"], rep[tier]["unknown"]
+        settled = w + l
+        pct = f"{100 * w / settled:.0f}%" if settled else "—"
+        lines.append(f"{cfg['icon']} {tier}: {w}✅ / {l}❌ (tutma {pct}) · naməlum {u}")
+        tot_w += w
+        tot_l += l
+        tot_u += u
+    settled = tot_w + tot_l
+    pct = f"{100 * tot_w / settled:.0f}%" if settled else "—"
+    lines.append(f"\nÜmumi: {tot_w}✅ / {tot_l}❌ (tutma {pct}) · naməlum {tot_u}")
+    lines.append("\nℹ️ 'naməlum' = nəticə mənbəyində (Odds API scores / API-Football) uyğun "
+                "oyun və ya market tapılmadı, kuponu heç bir tərəfə hesablamadıq.")
+    if not STATS_MODE:
+        lines.append("ℹ️ API_FOOTBALL_KEY yoxdur — korner/kart pick-ləri həmişə 'naməlum' qalacaq.")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -2416,6 +2769,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     txt = L["no_tier"].format(name=L["name_" + tier])
                 await status.edit_text(txt)
             return
+        await safe_call(record_coupon_for_settlement, coupon, user.id)   # sonrakı nəticə yoxlaması üçün saxla
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(L["btn_again"], callback_data=f"c:{tier}:{variant + 1}"),
             InlineKeyboardButton(L["btn_menu"], callback_data="m"),
@@ -2477,6 +2831,7 @@ async def post_init(app: Application):
     except Exception:
         log.exception("Komanda menyusu qurulmadı")
     app.bot_data["refresh"] = asyncio.create_task(refresh_loop(app))
+    app.bot_data["settle"] = asyncio.create_task(settle_loop())
 
 
 def watchdog():
@@ -2535,6 +2890,9 @@ def main():
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler(["yenile", "refresh"], cmd_refresh))
     app.add_handler(CommandHandler("footballorg", cmd_footballorg))
+    app.add_handler(CommandHandler(["statistika", "stats"], cmd_statistika))
+    app.add_handler(CommandHandler(["kuponlarim", "mycoupons"], cmd_mycoupons))
+    app.add_handler(CommandHandler(["netice", "results"], cmd_netice))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
     # drop_pending_updates: restartda köhnə yığılmış mesajlara cavab yağdırmasın
