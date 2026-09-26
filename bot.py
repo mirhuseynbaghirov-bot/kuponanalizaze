@@ -1880,18 +1880,37 @@ def call_gemini_vision(image_bytes, mime_type="image/jpeg"):
             ]
         }],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
+        "safetySettings": [
+            {"category": c, "threshold": "BLOCK_NONE"} for c in [
+                "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+                "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
+            ]
+        ],
     }
     try:
         r = requests.post(GEMINI_URL.format(model=GEMINI_MODEL),
                           params={"key": GEMINI_API_KEY}, json=body, timeout=40)
         r.raise_for_status()
         data = r.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        log.exception("Gemini sorğusu uğursuz")
+        return None
+    cands = data.get("candidates") or []
+    if not cands:
+        log.warning("Gemini cavab vermədi: %s", json.dumps(data.get("promptFeedback", {}))[:300])
+        return None
+    cand = cands[0]
+    if cand.get("finishReason") not in (None, "STOP"):
+        log.warning("Gemini finishReason=%s (şəkil blok oluna bilər)", cand.get("finishReason"))
+        return None
+    try:
+        text = cand["content"]["parts"][0]["text"]
         picks = json.loads(text)
         return picks if isinstance(picks, list) else None
     except Exception:
-        log.exception("Gemini kupon oxuma xətası")
+        log.exception("Gemini cavabı parse olunmadı: %s", str(cand)[:300])
         return None
+
 
 
 # Azərbaycan dilində yazılan komanda/ölkə adlarının Odds API-dakı İngilis adına uyğunlaşdırılması.
