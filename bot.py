@@ -26,6 +26,7 @@ Mühit dəyişənləri (Render → Environment):
   SHOW_OWNER_IN_COUPON      (ixtiyari) 1 = kuponun sonunda qurucu sətri göstərilir (default), 0 = gizlət
   BOT_USERNAME              (ixtiyari) avtomatik tapılır; tapılmasa əl ilə yaz (@-siz)
   FOOTBALL_DATA_ORG_KEY     (tövsiyə) football-data.org PULSUZ token-i (12 əsas liqada statistika)
+  GEMINI_API_KEY            (tövsiyə) Google AI Studio-dan pulsuz açar — /kuponumabax (kupon şəkli oxuma) üçün
 
 v4-də nə düzəldilib:
   * Statistika işləmirsə (pulsuz plan, xəta, az oyun) bot avtomatik bazar rejiminə keçir və kuponda bunu yazır.
@@ -40,8 +41,11 @@ v4-də nə düzəldilib:
   * PULSUZ football-data.org inteqrasiyası: 1X2 üçün öz Poisson modelimizlə statistika (12 əsas liqa).
   * DÜZƏLİŞ: pick seçimi yenidən EHTİMALA görə aparılır (kef hədəfə yaxınlıq ikinci dərəcəli meyardır) ki,
     eyni oyun üçün "Başqa variant" bir-birinə zidd pick (bir dəfə 1X, bir dəfə X2) verməsin.
+  * YENİ: /kuponumabax — istifadəçi öz kuponunun şəklini atır, Gemini vision ilə oxunur, hər oyuna
+    reaksiya verilir və sonda faizsiz ümumi rəy verilir.
 """
 import asyncio
+import base64
 import difflib
 import json
 import logging
@@ -66,6 +70,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 logging.basicConfig(
@@ -114,6 +120,13 @@ OWNER_NAME = env("OWNER_NAME", "Mirhüseyn Bağırov")
 OWNER_HANDLE = env("OWNER_HANDLE", "@Baghirov21")
 PROMO_TEXT = env("PROMO_TEXT")
 SHOW_OWNER_IN_COUPON = env("SHOW_OWNER_IN_COUPON", "1") != "0"
+
+# --- /kuponumabax (kupon şəkli oxuma) ---
+GEMINI_API_KEY = env("GEMINI_API_KEY")
+GEMINI_MODEL = env("GEMINI_MODEL", "gemini-2.5-flash")
+COUPON_READ_ENABLED = bool(GEMINI_API_KEY)
+COUPON_WAIT_SECONDS = 10 * 60
+
 TZ = ZoneInfo("Asia/Baku")
 
 ODDS_BASE = "https://api.the-odds-api.com/v4"
@@ -423,10 +436,12 @@ TXT = {
 }
 LANG_BUTTONS = [("az", "🇦🇿 Azərbaycanca"), ("en", "🇬🇧 English")]
 COMMANDS = {
-    "az": [("start", "Başla"), ("gununoyunlari", "Günün kuponu"), ("kuponlarim", "Kupon tarixçəm"),
+    "az": [("start", "Başla"), ("gununoyunlari", "Günün kuponu"), ("kuponumabax", "Öz kuponunu yoxla"),
+           ("kuponlarim", "Kupon tarixçəm"),
            ("statistika", "Tutma statistikası"), ("lang", "Dil / Language"),
            ("about", "Bot haqqında"), ("privacy", "Məxfilik")],
-    "en": [("start", "Start"), ("coupon", "Today's coupon"), ("mycoupons", "My coupon history"),
+    "en": [("start", "Start"), ("coupon", "Today's coupon"), ("kuponumabax", "Check my coupon"),
+           ("mycoupons", "My coupon history"),
            ("statistika", "Hit-rate stats"), ("lang", "Language"),
            ("about", "About the bot"), ("privacy", "Privacy")],
 }
@@ -1832,6 +1847,181 @@ def stat_gate(m, leg, mode="strict"):
     return False
 
 
+# ============================== KUPONUMABAX (İSTİFADƏÇİNİN ÖZ KUPONUNUN ŞƏKLİ) ==============================
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+COUPON_PROMPT = """Bu bir mərc kuponu skrinşotudur (misli.az "Kupon Detalı" formatına bənzər).
+Şəkildəki HƏR sətri oxu. Hər oyun üçün bunları çıxar:
+- home: ev komandasının adı (şəkildə yazıldığı kimi, Azərbaycan dilində)
+- away: qonaq komandasının adı
+- pick: seçilmiş variantın tam yazısı, MƏSƏLƏN "Cüt Şans: 12", "Cüt Şans: 1X", "Cüt Şans: X2",
+  "Oyun Nəticəsi 1X2: 1", "Oyun Nəticəsi 1X2: 2", "Oyun Nəticəsi 1X2: X", "Üst 2.5", "Alt 2.5",
+  "Korner Üst 9.5", "Kart Alt 4.5" və bənzərləri — şəkildə necə yazılıbsa elə köçür
+- odds: həmin sətrin kefi (əmsalı), rəqəm olaraq (məs. 1.29)
+
+Əgər bu, tanınan formatda (idman mərc kuponu, oyun siyahısı + keflər) bir şəkil DEYİLSƏ,
+boş massiv [] qaytar.
+
+Cavabı YALNIZ bu JSON formatında ver, başqa HEÇ NƏ yazma (izah, başlıq, ```json işarəsi yox):
+[{"home": "...", "away": "...", "pick": "...", "odds": 1.29}, ...]
+"""
+
+
+def call_gemini_vision(image_bytes, mime_type="image/jpeg"):
+    """Şəkli Gemini-yə göndərir, pick siyahısını (list[dict]) və ya None (xəta/tanınmadı) qaytarır."""
+    if not COUPON_READ_ENABLED:
+        return None
+    b64 = base64.b64encode(image_bytes).decode()
+    body = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": mime_type, "data": b64}},
+                {"text": COUPON_PROMPT},
+            ]
+        }],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
+    }
+    try:
+        r = requests.post(GEMINI_URL.format(model=GEMINI_MODEL),
+                          params={"key": GEMINI_API_KEY}, json=body, timeout=40)
+        r.raise_for_status()
+        data = r.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        picks = json.loads(text)
+        return picks if isinstance(picks, list) else None
+    except Exception:
+        log.exception("Gemini kupon oxuma xətası")
+        return None
+
+
+# Azərbaycan dilində yazılan komanda/ölkə adlarının Odds API-dakı İngilis adına uyğunlaşdırılması.
+# Yalnız ən çox rast gəlinən Avropa millilərini əhatə edir — lazım olduqca əlavə et.
+AZ_EN_TEAM_ALIASES = {
+    "sloveniya": "slovenia", "şotlandiya": "scotland", "bolqarıstan": "bulgaria",
+    "lüksemburq": "luxembourg", "şimali makedoniya": "north macedonia", "isveçrə": "switzerland",
+    "çexiya": "czech republic", "xorvatiya": "croatia", "albaniya": "albania", "belarus": "belarus",
+    "almaniya": "germany", "fransa": "france", "ispaniya": "spain", "italiya": "italy",
+    "portuqaliya": "portugal", "niderland": "netherlands", "hollandiya": "netherlands",
+    "belçika": "belgium", "ingiltərə": "england", "türkiyə": "turkey", "rusiya": "russia",
+    "ukrayna": "ukraine", "polşa": "poland", "avstriya": "austria", "serbiya": "serbia",
+    "yunanıstan": "greece", "rumıniya": "romania", "macarıstan": "hungary", "isveç": "sweden",
+    "norveç": "norway", "danimarka": "denmark", "finlandiya": "finland", "islandiya": "iceland",
+    "irlandiya": "ireland", "şimali irlandiya": "northern ireland", "uels": "wales",
+    "bosniya": "bosnia", "çernoqoriya": "montenegro", "moldova": "moldova", "gürcüstan": "georgia",
+    "ermənistan": "armenia", "azərbaycan": "azerbaijan", "qazaxıstan": "kazakhstan",
+    "kipr": "cyprus", "malta": "malta", "estoniya": "estonia", "latviya": "latvia",
+    "litva": "lithuania", "slovakiya": "slovakia", "san-marino": "san marino", "andorra": "andorra",
+    "liyxtenşteyn": "liechtenstein", "monako": "monaco", "kosovo": "kosovo", "izrail": "israel",
+    "farer adaları": "faroe islands",
+}
+
+
+def _norm_team_name(name):
+    return AZ_EN_TEAM_ALIASES.get((name or "").strip().lower(), name)
+
+
+def find_match_by_names(matches, home, away):
+    """Skrindəki komanda adlarını bugünkü baza ilə uyğunlaşdırır (name_score-dan istifadə edir)."""
+    h, a = _norm_team_name(home), _norm_team_name(away)
+    best, best_score = None, 0.0
+    for m in matches:
+        sh = name_score(h, m.home)
+        sa = name_score(a, m.away)
+        if min(sh, sa) < 0.5:
+            continue
+        score = sh + sa
+        if score > best_score:
+            best, best_score = m, score
+    return best if best_score >= 1.1 else None
+
+
+_PICK_LINE_RE = re.compile(r"(\d+(?:[.,]\d+)?)")
+
+
+def parse_pick_label(pick_text):
+    """Skrindəki pick yazısını (məs. 'Cüt Şans: 12') bizim daxili kind-ə çevirir.
+    Qaytarır: (kind, line) və ya (None, None) tanınmasa."""
+    if not pick_text:
+        return None, None
+    text = pick_text.strip()
+    low = text.lower()
+    prefix, _, val = text.rpartition(":")
+    prefix_l = (prefix or text).lower()
+    val = val.strip().upper() if prefix else text.strip().upper()
+
+    if "cüt" in prefix_l or "çüt" in prefix_l or "şans" in prefix_l:
+        return {"12": "dc12", "1X": "dc1x", "X2": "dcx2"}.get(val), None
+    if "1x2" in prefix_l or "nəticə" in prefix_l or "netice" in prefix_l:
+        return {"1": "home", "2": "away"}.get(val), None   # "X" (heç-heçə) dəstəklənmir
+    m = _PICK_LINE_RE.search(text)
+    line = float(m.group(1).replace(",", ".")) if m else None
+    if "korner" in low or "corner" in low:
+        return ("corners_over" if "üst" in low or "ust" in low or "over" in low else "corners_under"), line
+    if "kart" in low or "card" in low:
+        return ("cards_over" if "üst" in low or "ust" in low or "over" in low else "cards_under"), line
+    if "üst" in low or "ust" in low or "over" in low:
+        return "over", line
+    if "alt" in low or "under" in low:
+        return "under", line
+    return None, None
+
+
+def find_leg(m, kind, line=None):
+    if not m or not kind:
+        return None
+    cands = [l for l in m.legs if l.kind == kind]
+    if not cands:
+        return None
+    if line is not None:
+        cands.sort(key=lambda l: abs((l.line if l.line is not None else 0) - line))
+    return cands[0]
+
+
+def react_to_pick(m, leg, use_stats):
+    """(status, mətn) qaytarır. status: 'good' | 'mid' | 'risky'."""
+    if use_stats and _verified(m):
+        if stat_gate(m, leg, "strict"):
+            return "good", "✅ Bu oyun statistikaya görə böyük ehtimalla gələr."
+        if stat_gate(m, leg, "relaxed"):
+            return "mid", "🤔 Bu oyun bir qədər risklidir, amma mümkündür."
+        return "risky", "⚠️ Bu oyun statistikaya görə riskli görünür."
+    if leg.prob >= 0.65:
+        return "good", "✅ Bazar kefinə görə bu oyun böyük ehtimalla gələr."
+    if leg.prob >= 0.50:
+        return "mid", "🤔 Bazar kefinə görə bu oyun orta risklidir."
+    return "risky", "⚠️ Bazar kefinə görə bu oyun riskli görünür."
+
+
+def analyze_coupon_picks(snap, picks):
+    """Gemini-dən gələn pick siyahısını analiz edib mətn sətirləri + ümumi rəy qaytarır."""
+    use_stats = stats_usable(snap.matches)
+    lines, statuses = [], []
+    for i, p in enumerate(picks, 1):
+        home, away = p.get("home", "?"), p.get("away", "?")
+        head = f"{i}. {home} - {away}"
+        m = find_match_by_names(snap.matches, home, away)
+        kind, line = parse_pick_label(p.get("pick", ""))
+        leg = find_leg(m, kind, line) if (m and kind) else None
+        if not m or not leg:
+            lines.append(f"{head}\n   ❓ Bu oyun/pick üçün məlumatımız yoxdur.")
+            statuses.append("no_data")
+            continue
+        status, text = react_to_pick(m, leg, use_stats)
+        lines.append(f"{head}\n   {text}")
+        statuses.append(status)
+
+    counted = Counter(s for s in statuses if s != "no_data")
+    if not counted:
+        verdict = "🤷 Kuponundakı oyunlar barədə kifayət qədər məlumatımız olmadı — dəqiq rəy verə bilmirik."
+    elif counted["risky"] > counted["good"]:
+        verdict = "🔴 Bu kupon ümumilikdə riskli görünür."
+    elif counted["risky"] == 0 and counted["mid"] == 0:
+        verdict = "🟢 Bu kupon böyük ehtimalla gələcək kimi görünür."
+    else:
+        verdict = "🟡 Bu kupon qarışıqdır — bəzi seçimlər yaxşı, bəziləri riskli."
+    return "\n\n".join(lines) + "\n\n" + verdict
+
+
 # ============================== NƏTİCƏ İZLƏMƏ (SETTLEMENT) ==============================
 # Hər verilən kupon Redis-də saxlanılır, sonra real nəticələrlə (Odds API-nin PULSUZ
 # /scores endpoint-i + korner/kart üçün API-Football) yoxlanılır. Bu, həm admin panelində
@@ -2437,6 +2627,7 @@ def format_admin(lang, rep, snap):
 # ============================== TELEGRAM ==============================
 _last_click = {}
 _last_admin_alert = {"t": 0.0}
+_awaiting_coupon_photo = {}   # uid -> vaxt (timestamp) — /kuponumabax-dan sonra şəkil gözlənilir
 
 
 def display_name(user):
@@ -2795,6 +2986,50 @@ async def cmd_netice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_kuponumabax(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """İstifadəçi öz kuponunun şəklini atır, bot analiz edir."""
+    L = T(await user_lang(update.effective_user))
+    if not COUPON_READ_ENABLED:
+        await update.message.reply_text("⚠️ Bu funksiya hazırda deaktivdir.")
+        return
+    _awaiting_coupon_photo[update.effective_user.id] = time.time()
+    await update.message.reply_text("📸 Kuponunun şəklini at, baxım.")
+
+
+async def on_coupon_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/kuponumabax-dan sonra atılan şəkli oxuyur. Başqa vaxt gələn şəkillərə toxunmur."""
+    uid = update.effective_user.id
+    started = _awaiting_coupon_photo.get(uid)
+    if not started or time.time() - started > COUPON_WAIT_SECONDS:
+        return
+    _awaiting_coupon_photo.pop(uid, None)
+
+    status = await update.message.reply_text("🔍 Kuponu oxuyuram...")
+    try:
+        photo = update.message.photo[-1]
+        tg_file = await context.bot.get_file(photo.file_id)
+        img_bytes = bytes(await tg_file.download_as_bytearray())
+
+        picks = await asyncio.to_thread(call_gemini_vision, img_bytes)
+        if not picks:
+            await status.edit_text("😕 Şəkli oxuya bilmədim. Aydın, tam kupon skrini at (kupon detalı səhifəsi).")
+            return
+
+        snap, ok, attempted = peek_snapshot()
+        if snap is None:
+            await status.edit_text("⏳ Bugünkü oyun bazası hələ hazır deyil, bir az sonra yenidən cəhd et.")
+            return
+
+        result = await asyncio.to_thread(analyze_coupon_picks, snap, picks)
+        await status.edit_text(result)
+    except Exception:
+        log.exception("/kuponumabax xətası")
+        try:
+            await status.edit_text("⚠️ Xəta baş verdi. Bir az sonra yenidən cəhd et.")
+        except Exception:
+            pass
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -2979,9 +3214,10 @@ def keep_alive():
 
 
 def main():
-    log.info("Statistika mənbələri: API-Football=%s | football-data.org=%s | istifadəçi limiti: %s/gün | "
-             "Odds büdcə: %s+%s/gün | qurucu: %s %s",
+    log.info("Statistika mənbələri: API-Football=%s | football-data.org=%s | kupon şəkli oxuma=%s | "
+             "istifadəçi limiti: %s/gün | Odds büdcə: %s+%s/gün | qurucu: %s %s",
              "AÇIQ" if STATS_MODE else "SÖNDÜRÜLÜB", "AÇIQ (pulsuz)" if FD_ORG_MODE else "SÖNDÜRÜLÜB",
+             "AÇIQ" if COUPON_READ_ENABLED else "SÖNDÜRÜLÜB",
              USER_DAILY_LIMIT or "limitsiz", DAILY_CREDIT_BUDGET, EXTRA_CREDIT_BUDGET,
              OWNER_NAME, OWNER_HANDLE)
     if (DAILY_CREDIT_BUDGET + EXTRA_CREDIT_BUDGET) * 31 > 500:
@@ -3005,7 +3241,9 @@ def main():
     app.add_handler(CommandHandler("islemek", cmd_islemek))
     app.add_handler(CommandHandler(["statistika", "stats"], cmd_statistika))
     app.add_handler(CommandHandler(["kuponlarim", "mycoupons"], cmd_mycoupons))
-    app.add_handler(CommandHandler(["netice", "results"], cmd_netice))
+    app.add_handler(CommandHandler("netice", cmd_netice))
+    app.add_handler(CommandHandler("kuponumabax", cmd_kuponumabax))
+    app.add_handler(MessageHandler(filters.PHOTO, on_coupon_photo))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
     # drop_pending_updates: restartda köhnə yığılmış mesajlara cavab yağdırmasın
