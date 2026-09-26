@@ -152,9 +152,14 @@ GATES = {
 
 # Məşhur liqalar: hər biri üçün 2 market (h2h + totals) = 2 kredit.
 # Siyahıda olan liqa Odds API-da yoxdursa, sadəcə ignor olunur.
+# QEYD: Millətlər Liqası (Nations League) və dövlət yığmaları arası turnirlər ən yuxarıda —
+# beynəlxalq fasilə günlərində bunlar Argentina/Braziliya kimi klub liqalarından ÖNCƏLİKLİDİR.
 TOP_LEAGUES = [
+    "soccer_uefa_nations_league",
+    "soccer_fifa_world_cup_qualification",
     "soccer_uefa_champs_league",
     "soccer_uefa_europa_league",
+    "soccer_uefa_europa_conference_league",
     "soccer_epl",
     "soccer_spain_la_liga",
     "soccer_italy_serie_a",
@@ -170,7 +175,8 @@ TOP_LEAGUES = [
 #  lo/hi           : ÜMUMİ kef aralığı
 #  legs            : {oyun sayı: çəki} — sayı təsadüfi seçilir (həmişə eyni olmasın)
 #  min_legs        : bundan az oyunla kupon verilmir
-#  extra_w         : {əlavə/aşağı liqadan neçə oyun icazəlidir: çəki}
+#  extra_w         : {əlavə/aşağı liqadan neçə oyun icazəlidir: çəki} — YALNIZ məşhur liqalarda
+#                    kifayət qədər oyun olmayanda (fallback) istifadə olunur, süni "müxtəliflik" üçün yox
 #  league_cap      : eyni liqadan maksimum oyun
 #  extras          : korner/kart pick-lərinə icazə (ehtiyatlı kuponda YOX)
 TIERS = {
@@ -2194,9 +2200,12 @@ def build_coupon(matches, tier, variant=0, now=None, use_stats=None):
     choices = {n: w for n, w in cfg["legs"].items() if n <= len(ids)} or {len(ids): 1}
     n = rng.choices(list(choices), weights=list(choices.values()))[0]
 
-    # bu kupon üçün hədəf ümumi kef və neçə əlavə-liqa oyununa icazə (təsadüfi, bəzən 0)
+    # bu kupon üçün hədəf ümumi kef
     t0 = math.exp(rng.uniform(math.log(cfg["lo"] * 1.05), math.log(cfg["hi"] * 0.95)))
-    extra_pref = rng.choices(list(cfg["extra_w"]), weights=list(cfg["extra_w"].values()))[0]
+    # Aşağı/əlavə liqadan neçə oyuna icazə: YALNIZ FALLBACK. Məşhur liqalarda (TOP_LEAGUES)
+    # kifayət qədər oyun varsa əlavə liqaya ehtiyac yoxdur (extra_pref=0); çatışmazsa
+    # aşağıdakı "cap = max(extra_pref, nn - n_top)" bunu avtomatik açır.
+    extra_pref = 0
 
     result = first_closest = None
     for nn in [n] + list(range(n - 1, max(cfg["min_legs"], 2) - 1, -1)):
@@ -2607,6 +2616,109 @@ async def cmd_footballorg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+# ---- /islemek: 3 məlumat mənbəyinin (Odds API, API-Football, football-data.org) canlı sağlamlıq yoxlaması ----
+def _check_odds_api():
+    """Odds API: /sports PULSUZDUR, ona görə burda kredit xərclənmir."""
+    try:
+        leagues, remaining = discover_leagues()
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        if code == 401:
+            return dict(ok=False, msg="açar səhvdir (401) — ODDS_API_KEY-i yoxla")
+        return dict(ok=False, msg=f"HTTP xətası ({code})")
+    except Exception as e:
+        return dict(ok=False, msg=f"sorğu uğursuz: {str(e)[:150]}")
+    if not leagues:
+        return dict(ok=False, msg="açar işləyir, amma heç bir futbol liqası tapılmadı")
+    warn = remaining is not None and remaining < LOW_CREDIT_WARN
+    msg = f"{len(leagues)} liqa aktiv · qalan kredit: {remaining if remaining is not None else '?'}"
+    if warn:
+        msg += " ⚠️ kredit azalıb"
+    return dict(ok=True, msg=msg, warn=warn)
+
+
+def _check_football_api():
+    """API-Football: /status endpoint-i abunəlik məlumatını göstərir (əsas statistika mənbəyi)."""
+    if not STATS_MODE:
+        return dict(ok=None, msg="API_FOOTBALL_KEY təyin edilməyib — söndürülüb")
+    try:
+        api = FootballAPI(FOOTBALL_KEY, budget=3)
+        resp = api.get("/status")
+    except FootballError as e:
+        reason_map = {"plan": "pulsuz plan cari mövsümü vermir (bot bazar rejiminə keçib)",
+                      "auth": "açar səhvdir", "quota": "gündəlik sorğu limiti bitib",
+                      "budget": "daxili büdcə bitib"}
+        return dict(ok=False, msg=reason_map.get(str(e), str(e)[:150]))
+    except Exception as e:
+        return dict(ok=False, msg=f"sorğu uğursuz: {str(e)[:150]}")
+    sub = (resp[0].get("subscription") or {}) if resp else {}
+    plan, active = sub.get("plan"), sub.get("active")
+    msg = "açar işləkdir"
+    if plan:
+        msg += f" · plan: {plan}"
+    if active is False:
+        msg += " ⚠️ abunəlik aktiv deyil"
+    return dict(ok=True, msg=msg)
+
+
+def _check_football_org():
+    """football-data.org: /competitions endpoint-i pulsuz plan üçün də açıqdır (ehtiyat statistika mənbəyi)."""
+    if not FD_ORG_MODE:
+        return dict(ok=None, msg="FOOTBALL_DATA_ORG_KEY təyin edilməyib — söndürülüb")
+    try:
+        api = FootballOrgAPI(FOOTBALL_ORG_KEY)
+        data = api.get("/competitions")
+    except FootballOrgError as e:
+        reason_map = {"auth": "açar səhvdir",
+                      "quota": "dəqiqəlik limit bitib (bir az sonra özü düzələcək)",
+                      "network": "şəbəkə xətası"}
+        return dict(ok=False, msg=reason_map.get(str(e), str(e)[:150]))
+    except Exception as e:
+        return dict(ok=False, msg=f"sorğu uğursuz: {str(e)[:150]}")
+    n = len(data.get("competitions") or [])
+    return dict(ok=True, msg=f"açar işləkdir · {n} liqa əlçatandır")
+
+
+def check_all_sources():
+    return dict(odds=_check_odds_api(), football=_check_football_api(), footballorg=_check_football_org())
+
+
+async def cmd_islemek(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /islemek — Odds API, API-Football və football-data.org-un CANLI sağlamlığını yoxlayır."""
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return
+    msg = await update.message.reply_text("🔍 3 mənbə yoxlanılır...")
+    try:
+        r = await asyncio.to_thread(check_all_sources)
+    except Exception:
+        log.exception("/islemek xətası")
+        await msg.edit_text("⚠️ Yoxlama zamanı xəta baş verdi. Render Logs-a bax.")
+        return
+
+    def line(name, res):
+        if res["ok"] is True:
+            icon = "⚠️" if res.get("warn") else "✅"
+        elif res["ok"] is False:
+            icon = "❌"
+        else:
+            icon = "➖"
+        return f"{icon} {name}: {res['msg']}"
+
+    lines = [
+        "🔍 Mənbə vəziyyəti",
+        "",
+        line("Odds API (bazar çoxluğu)", r["odds"]),
+        line("API-Football (əsas statistika)", r["football"]),
+        line("football-data.org (ehtiyat statistika)", r["footballorg"]),
+    ]
+    if r["odds"]["ok"] is False:
+        lines.append("\n🚨 Odds API işləmirsə bot ümumiyyətlə kupon verə bilməz — bunu ilk növbədə düzəlt.")
+    elif r["football"]["ok"] is False and r["footballorg"]["ok"] is False:
+        lines.append("\n⚠️ Hər iki statistika mənbəyi xətalıdır — kuponlar müvəqqəti yalnız bazar kefinə əsaslanacaq.")
+    await msg.edit_text("\n".join(lines))
+
+
 async def cmd_statistika(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Hamıya açıq: son 30 günün tier üzrə tutma faizi (şəffaflıq/etibar üçün, şəxsi məlumat yoxdur)."""
     lang = await user_lang(update.effective_user)
@@ -2890,6 +3002,7 @@ def main():
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler(["yenile", "refresh"], cmd_refresh))
     app.add_handler(CommandHandler("footballorg", cmd_footballorg))
+    app.add_handler(CommandHandler("islemek", cmd_islemek))
     app.add_handler(CommandHandler(["statistika", "stats"], cmd_statistika))
     app.add_handler(CommandHandler(["kuponlarim", "mycoupons"], cmd_mycoupons))
     app.add_handler(CommandHandler(["netice", "results"], cmd_netice))
