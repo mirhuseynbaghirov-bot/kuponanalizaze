@@ -73,6 +73,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+import botplus
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -454,10 +455,11 @@ LANG_BUTTONS = [("az", "🇦🇿 Azərbaycanca"), ("en", "🇬🇧 English")]
 COMMANDS = {
     "az": [("start", "Başla"), ("gununoyunlari", "Günün kuponu"), ("kuponumabax", "Öz kuponunu yoxla"),
            ("kuponlarim", "Kupon tarixçəm"), ("davet", "Dostunu dəvət et"),
-           ("statistika", "Tutma statistikası"), ("lang", "Dil / Language"),
+           ("komandam", "Sevimli komandam"),
            ("about", "Bot haqqında"), ("privacy", "Məxfilik")],
     "en": [("start", "Start"), ("coupon", "Today's coupon"), ("kuponumabax", "Check my coupon"),
            ("mycoupons", "My coupon history"), ("davet", "Invite a friend"),
+           ("myteam", "My favorite team"),
            ("statistika", "Hit-rate stats"), ("lang", "Language"),
            ("about", "About the bot"), ("privacy", "Privacy")],
 }
@@ -3292,10 +3294,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status.edit_text(txt)
             return
         await safe_call(record_coupon_for_settlement, coupon, user.id)   # sonrakı nəticə yoxlaması üçün saxla
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(L["btn_again"], callback_data=f"c:{tier}:{variant + 1}"),
-            InlineKeyboardButton(L["btn_menu"], callback_data="m"),
-        ]])
+                token = await safe_call(botplus.save_share, coupon, lang)
+        rows = [[InlineKeyboardButton(L["btn_again"], callback_data=f"c:{tier}:{variant + 1}"),
+                 InlineKeyboardButton(L["btn_menu"], callback_data="m")]]
+        if token:
+            rows.append([InlineKeyboardButton(botplus.share_label(lang), callback_data=f"s:{token}")])
+        kb = InlineKeyboardMarkup(rows)
         left = max(0, limit_eff - used - 1) if limited else None
         await status.edit_text(format_coupon(lang, coupon, left=left, limit=limit_eff),
                                reply_markup=kb)
@@ -3354,6 +3358,7 @@ async def post_init(app: Application):
         log.exception("Komanda menyusu qurulmadı")
     app.bot_data["refresh"] = asyncio.create_task(refresh_loop(app))
     app.bot_data["settle"] = asyncio.create_task(settle_loop())
+    app.bot_data["fav"] = asyncio.create_task(botplus.fav_loop(app))
 
 
 def watchdog():
@@ -3404,6 +3409,10 @@ def main():
            .post_init(post_init)
            .concurrent_updates(True)   # bir istifadəçinin gözləməsi digərini dondurmasın
            .build())
+    botplus.init(kv=kv, TZ=TZ, T=T, pick_text=pick_text, name_score=name_score,
+                 peek_snapshot=peek_snapshot, get_lang=stats.get_lang, bot_info=_bot_info,
+                 OWNER_NAME=OWNER_NAME, OWNER_HANDLE=OWNER_HANDLE,
+                 AZ_EN_TEAM_ALIASES=AZ_EN_TEAM_ALIASES, DEFAULT_LANG=DEFAULT_LANG)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler(["gununoyunlari", "coupon"], cmd_menu))
     app.add_handler(CommandHandler("lang", cmd_lang))
@@ -3421,6 +3430,9 @@ def main():
     app.add_handler(CommandHandler("elan", cmd_elan))
     app.add_handler(CommandHandler("kuponumabax", cmd_kuponumabax))
     app.add_handler(MessageHandler(filters.PHOTO, on_coupon_photo))
+    app.add_handler(CommandHandler(["komandam", "myteam"], botplus.cmd_team))
+    app.add_handler(CallbackQueryHandler(botplus.on_callback, pattern=r"^(s|fav):"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, botplus.on_text))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
     # drop_pending_updates: restartda köhnə yığılmış mesajlara cavab yağdırmasın
