@@ -2011,6 +2011,29 @@ def react_to_pick(m, leg, use_stats):
     return "risky", "⚠️ Bazar kefinə görə bu oyun riskli görünür."
 
 
+def match_analysis_lines(m):
+    """
+    Bir oyun üçün 'Kefə görə 1/X/2', 'Statistikaya görə 1/X/2' və mövcuddursa son oyunlar
+    formasını qaytarır. Heç bir yeni sorğu göndərmir — snapshot-da onsuz da olan p3/info-dan oxuyur.
+    """
+    out = []
+    if m.p3:
+        h, d, a = (round(x * 100) for x in m.p3)
+        out.append(f"📊 Kefə görə 1/X/2: {h}/{d}/{a}%")
+    if _verified(m) and m.info.get("pct"):
+        h, d, a = (round(x * 100) for x in m.info["pct"])
+        out.append(f"📈 Statistikaya görə 1/X/2: {h}/{d}/{a}%")
+        form = m.info.get("form") or []
+        if len(form) == 2 and form[0] and form[1]:
+            out.append(f"🔎 Son oyunlar: {_sn(m.home)} {form[0]} · {_sn(m.away)} {form[1]}")
+        h2h = m.info.get("h2h")
+        if h2h and len(h2h) == 4 and h2h[3] >= 3:
+            out.append(f"🤝 Qarşılıqlı ({h2h[3]} oyun): {_sn(m.home)} {h2h[0]}Q-{h2h[1]}H-{h2h[2]}İ")
+    else:
+        out.append("📈 Statistikaya görə: bu oyun üçün statistika yoxdur (yalnız bazar kefinə əsaslanır)")
+    return out
+
+
 def analyze_coupon_picks(snap, picks):
     """Gemini-dən gələn pick siyahısını analiz edib mətn sətirləri + ümumi rəy qaytarır."""
     use_stats = stats_usable(snap.matches)
@@ -2019,15 +2042,24 @@ def analyze_coupon_picks(snap, picks):
         home, away = p.get("home", "?"), p.get("away", "?")
         head = f"{i}. {home} - {away}"
         m = find_match_by_names(snap.matches, home, away)
-        kind, line = parse_pick_label(p.get("pick", ""))
-        leg = find_leg(m, kind, line) if (m and kind) else None
-        if not m or not leg:
-            lines.append(f"{head}\n   ❓ Bu oyun/pick üçün məlumatımız yoxdur.")
+        if not m:
+            lines.append(f"{head}\n   ❓ Bu oyun üçün məlumatımız yoxdur.")
             statuses.append("no_data")
             continue
-        status, text = react_to_pick(m, leg, use_stats)
-        lines.append(f"{head}\n   {text}")
-        statuses.append(status)
+
+        kind, line = parse_pick_label(p.get("pick", ""))
+        leg = find_leg(m, kind, line)
+        block = [head]
+        if leg:
+            status, text = react_to_pick(m, leg, use_stats)
+            block.append(f"   {text}")
+            statuses.append(status)
+        else:
+            block.append("   ❓ Bu pick tipi üçün dəqiq analiz edə bilmədik.")
+            statuses.append("no_data")
+        for extra in match_analysis_lines(m):
+            block.append(f"   {extra}")
+        lines.append("\n".join(block))
 
     counted = Counter(s for s in statuses if s != "no_data")
     if not counted:
@@ -2826,7 +2858,7 @@ async def cmd_footballorg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-# ---- /islemek: 3 məlumat mənbəyinin (Odds API, API-Football, football-data.org) canlı sağlamlıq yoxlaması ----
+# ---- /islemek: 4 məlumat mənbəyinin (Odds API, API-Football, football-data.org, Gemini) canlı sağlamlıq yoxlaması ----
 def _check_odds_api():
     """Odds API: /sports PULSUZDUR, ona görə burda kredit xərclənmir."""
     try:
@@ -2889,16 +2921,39 @@ def _check_football_org():
     return dict(ok=True, msg=f"açar işləkdir · {n} liqa əlçatandır")
 
 
+def _check_gemini():
+    """Gemini (kupon şəkli oxuma): açarın işlək olub-olmadığını real sorğu ilə yoxlayır."""
+    if not COUPON_READ_ENABLED:
+        return dict(ok=None, msg="GEMINI_API_KEY təyin edilməyib — söndürülüb")
+    try:
+        r = requests.post(
+            GEMINI_URL.format(model=GEMINI_MODEL),
+            params={"key": GEMINI_API_KEY},
+            json={"contents": [{"parts": [{"text": "Tək söz ilə cavab ver: ok"}]}]},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            try:
+                err = (r.json().get("error") or {}).get("message", "")
+            except Exception:
+                err = r.text[:200]
+            return dict(ok=False, msg=f"HTTP {r.status_code}: {err[:200]}")
+        return dict(ok=True, msg=f"açar işləkdir · model: {GEMINI_MODEL}")
+    except Exception as e:
+        return dict(ok=False, msg=f"sorğu uğursuz: {str(e)[:200]}")
+
+
 def check_all_sources():
-    return dict(odds=_check_odds_api(), football=_check_football_api(), footballorg=_check_football_org())
+    return dict(odds=_check_odds_api(), football=_check_football_api(),
+               footballorg=_check_football_org(), gemini=_check_gemini())
 
 
 async def cmd_islemek(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /islemek — Odds API, API-Football və football-data.org-un CANLI sağlamlığını yoxlayır."""
+    """Admin: /islemek — Odds API, API-Football, football-data.org və Gemini-nin CANLI sağlamlığını yoxlayır."""
     user = update.effective_user
     if user.id not in ADMIN_IDS:
         return
-    msg = await update.message.reply_text("🔍 3 mənbə yoxlanılır...")
+    msg = await update.message.reply_text("🔍 4 mənbə yoxlanılır...")
     try:
         r = await asyncio.to_thread(check_all_sources)
     except Exception:
@@ -2921,6 +2976,7 @@ async def cmd_islemek(update: Update, context: ContextTypes.DEFAULT_TYPE):
         line("Odds API (bazar çoxluğu)", r["odds"]),
         line("API-Football (əsas statistika)", r["football"]),
         line("football-data.org (ehtiyat statistika)", r["footballorg"]),
+        line("Gemini (/kuponumabax şəkil oxuma)", r["gemini"]),
     ]
     if r["odds"]["ok"] is False:
         lines.append("\n🚨 Odds API işləmirsə bot ümumiyyətlə kupon verə bilməz — bunu ilk növbədə düzəlt.")
