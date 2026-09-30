@@ -262,6 +262,14 @@ TXT = {
         ),
         "privacy_contact": "\nMəlumatın silinməsi üçün: {contact}",
         "your_id": "Sənin Telegram ID-n: {id}",
+        "invite_text": (
+            "🎁 Dostunu dəvət et, hər qoşulan dostun üçün +1 gündəlik kupon krediti qazan (daimi qalır)!\n\n"
+            "🔗 Sənin şəxsi linkin:\n{link}\n\n"
+            "🎟 İndiyə qədər qazandığın bonus kredit: {bonus}"
+        ),
+        "invite_no_bot": "⚠️ Bot username-i hələ müəyyən olunmayıb, bir az sonra yenidən /davet yaz.",
+        "ref_thanks_referrer": "🎉 Dəvət linkinlə yeni istifadəçi qoşuldu! +1 gündəlik kupon krediti qazandın (daimi).",
+        "ref_thanks_invitee": "🎁 Dəvət bonusu: +1 gündəlik kupon krediti qazandın!",
         "p_win": "{team} qalib",
         "p_1x": "{team} məğlub olmaz (1X)",
         "p_x2": "{team} məğlub olmaz (X2)",
@@ -377,6 +385,14 @@ TXT = {
         ),
         "privacy_contact": "\nTo delete your data contact: {contact}",
         "your_id": "Your Telegram ID: {id}",
+        "invite_text": (
+            "🎁 Invite friends and earn +1 daily coupon credit for each one who joins (permanent)!\n\n"
+            "🔗 Your personal link:\n{link}\n\n"
+            "🎟 Bonus credits earned so far: {bonus}"
+        ),
+        "invite_no_bot": "⚠️ Bot username isn't known yet, try /davet again in a moment.",
+        "ref_thanks_referrer": "🎉 Someone joined using your invite link! You earned +1 daily coupon credit (permanent).",
+        "ref_thanks_invitee": "🎁 Invite bonus: you earned +1 daily coupon credit!",
         "p_win": "{team} to win",
         "p_1x": "{team} win or draw (1X)",
         "p_x2": "{team} win or draw (X2)",
@@ -437,11 +453,11 @@ TXT = {
 LANG_BUTTONS = [("az", "🇦🇿 Azərbaycanca"), ("en", "🇬🇧 English")]
 COMMANDS = {
     "az": [("start", "Başla"), ("gununoyunlari", "Günün kuponu"), ("kuponumabax", "Öz kuponunu yoxla"),
-           ("kuponlarim", "Kupon tarixçəm"),
+           ("kuponlarim", "Kupon tarixçəm"), ("davet", "Dostunu dəvət et"),
            ("statistika", "Tutma statistikası"), ("lang", "Dil / Language"),
            ("about", "Bot haqqında"), ("privacy", "Məxfilik")],
     "en": [("start", "Start"), ("coupon", "Today's coupon"), ("kuponumabax", "Check my coupon"),
-           ("mycoupons", "My coupon history"),
+           ("mycoupons", "My coupon history"), ("davet", "Invite a friend"),
            ("statistika", "Hit-rate stats"), ("lang", "Language"),
            ("about", "About the bot"), ("privacy", "Privacy")],
 }
@@ -494,6 +510,10 @@ class MemKV:
         with self._lock:
             return len(self._s.get(key, ()))
 
+    def smembers(self, key):
+        with self._lock:
+            return list(self._s.get(key, ()))
+
     def get(self, key):
         with self._lock:
             return self._k.get(key)
@@ -542,6 +562,9 @@ class RedisREST:
     def scard(self, key):
         return int(self._cmd("SCARD", key) or 0)
 
+    def smembers(self, key):
+        return self._cmd("SMEMBERS", key) or []
+
     def get(self, key):
         return self._cmd("GET", key)
 
@@ -587,6 +610,21 @@ def clean_source(s):
     """/start instagram → 'instagram'. Yalnız hərf, rəqəm, _ və -."""
     s = re.sub(r"[^a-z0-9_-]", "", (s or "").lower())[:20]
     return s or "direct"
+
+
+def bonus_credits(uid):
+    """İstifadəçinin referral vasitəsilə qazandığı daimi (gündəlik limitə əlavə olunan) bonus kredit sayı."""
+    try:
+        return int(kv.hget(f"u:{uid}", "bonus") or 0)
+    except Exception:
+        return 0
+
+
+def bonus_credits_add(uid, n=1):
+    try:
+        kv.hincrby(f"u:{uid}", "bonus", n)
+    except Exception:
+        log.warning("bonus kredit yazılmadı: %s", uid)
 
 
 class Stats:
@@ -2726,20 +2764,79 @@ def lang_keyboard():
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # /start instagram → reklam mənbəyi (t.me/BOT?start=instagram)
+    # /start instagram → reklam mənbəyi; /start ref<uid> → referral (dəvət) linki
     source = context.args[0] if context.args else None
-    await safe_call(stats.touch_user, user.id, display_name(user), source)
+    is_new = await safe_call(stats.touch_user, user.id, display_name(user), source)
     lang = await user_lang(user)
     L = T(lang)
+
+    # --- referral bonusu: yalnız İLK dəfə /start edən istifadəçilərdə işləyir ---
+    referred = False
+    ref_match = re.match(r"^ref(\d+)$", (source or "").lower())
+    if is_new and ref_match:
+        ref_id = int(ref_match.group(1))
+        if ref_id != user.id:
+            referred = True
+            await safe_call(bonus_credits_add, ref_id, 1)
+            await safe_call(bonus_credits_add, user.id, 1)
+            try:
+                r_lang = await safe_call(stats.get_lang, ref_id) or (DEFAULT_LANG if DEFAULT_LANG in TXT else "az")
+                await context.bot.send_message(ref_id, T(r_lang)["ref_thanks_referrer"])
+            except Exception:
+                log.warning("Referrera bildiriş göndərilmədi: %s", ref_id)
+
     text = L["welcome"]
     if USER_DAILY_LIMIT > 0:
         text += L["welcome_limit"].format(limit=USER_DAILY_LIMIT)
+    if referred:
+        text += "\n\n" + L["ref_thanks_invitee"]
     text += "\n\n" + L["made_by"].format(name=OWNER_NAME, handle=OWNER_HANDLE)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(L["btn_coupon"], callback_data="m")],
         [InlineKeyboardButton(label, callback_data=f"l:{code}") for code, label in LANG_BUTTONS],
     ])
     await update.message.reply_text(text, reply_markup=kb)
+
+
+async def cmd_davet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """İstifadəçinin şəxsi dəvət (referral) linkini göstərir."""
+    user = update.effective_user
+    L = T(await user_lang(user))
+    if not _bot_info["username"] and getattr(context.bot, "username", None):
+        _bot_info["username"] = context.bot.username
+    uname = _bot_info["username"]
+    if not uname:
+        await update.message.reply_text(L["invite_no_bot"])
+        return
+    link = f"https://t.me/{uname}?start=ref{user.id}"
+    bonus = await safe_call(bonus_credits, user.id) or 0
+    await update.message.reply_text(L["invite_text"].format(link=link, bonus=bonus))
+
+
+async def cmd_elan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /elan <mətn> — bütün istifadəçilərə elan göndərir."""
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text("İstifadə: /elan <mətn>")
+        return
+    uids = await safe_call(kv.smembers, "users:all") or []
+    if not uids:
+        await update.message.reply_text("⚠️ İstifadəçi tapılmadı.")
+        return
+    status = await update.message.reply_text(f"📢 {len(uids)} istifadəçiyə göndərilir...")
+    sent = failed = 0
+    for i, uid in enumerate(uids):
+        try:
+            await context.bot.send_message(int(uid), text)
+            sent += 1
+        except Exception:
+            failed += 1
+        if i % 25 == 24:      # Telegram flood limitinə hörmət
+            await asyncio.sleep(1)
+    await status.edit_text(f"✅ Göndərildi: {sent} · ❌ Uğursuz: {failed}")
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3144,10 +3241,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- gündəlik kupon krediti (hər kupon, o cümlədən "Başqa variant", 1 kredit) ----
     limited = USER_DAILY_LIMIT > 0 and not (ADMIN_EXEMPT and user.id in ADMIN_IDS)
     used = 0
+    limit_eff = USER_DAILY_LIMIT
     if limited:
+        bonus = await safe_call(bonus_credits, user.id) or 0     # /davet ilə qazanılan daimi bonus kredit
+        limit_eff = USER_DAILY_LIMIT + bonus
         used = await safe_call(stats.used_today, user.id) or 0
-        if used >= USER_DAILY_LIMIT:
-            await q.message.reply_text(L["limit_reached"].format(limit=USER_DAILY_LIMIT))
+        if used >= limit_eff:
+            await q.message.reply_text(L["limit_reached"].format(limit=limit_eff))
             return
 
     status = await q.message.reply_text(L["checking"])
@@ -3196,8 +3296,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton(L["btn_again"], callback_data=f"c:{tier}:{variant + 1}"),
             InlineKeyboardButton(L["btn_menu"], callback_data="m"),
         ]])
-        left = max(0, USER_DAILY_LIMIT - used - 1) if limited else None
-        await status.edit_text(format_coupon(lang, coupon, left=left, limit=USER_DAILY_LIMIT),
+        left = max(0, limit_eff - used - 1) if limited else None
+        await status.edit_text(format_coupon(lang, coupon, left=left, limit=limit_eff),
                                reply_markup=kb)
     except Exception:
         log.exception("Kupon xətası")
@@ -3317,6 +3417,8 @@ def main():
     app.add_handler(CommandHandler(["statistika", "stats"], cmd_statistika))
     app.add_handler(CommandHandler(["kuponlarim", "mycoupons"], cmd_mycoupons))
     app.add_handler(CommandHandler("netice", cmd_netice))
+    app.add_handler(CommandHandler("davet", cmd_davet))
+    app.add_handler(CommandHandler("elan", cmd_elan))
     app.add_handler(CommandHandler("kuponumabax", cmd_kuponumabax))
     app.add_handler(MessageHandler(filters.PHOTO, on_coupon_photo))
     app.add_handler(CallbackQueryHandler(on_button))
