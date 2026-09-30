@@ -3294,9 +3294,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status.edit_text(txt)
             return
         await safe_call(record_coupon_for_settlement, coupon, user.id)   # sonrakı nəticə yoxlaması üçün saxla
-                token = await safe_call(botplus.save_share, coupon, lang)
-        rows = [[InlineKeyboardButton(L["btn_again"], callback_data=f"c:{tier}:{variant + 1}"),
-                 InlineKeyboardButton(L["btn_menu"], callback_data="m")]]
+        token = await safe_call(botplus.save_share, coupon, lang)
+              rows = [[InlineKeyboardButton(L["btn_again"], callback_data=f"c:{tier}:{variant + 1}"),
+              InlineKeyboardButton(L["btn_menu"], callback_data="m")]]
         if token:
             rows.append([InlineKeyboardButton(botplus.share_label(lang), callback_data=f"s:{token}")])
         kb = InlineKeyboardMarkup(rows)
