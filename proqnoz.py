@@ -10,6 +10,7 @@ Heç bir yeni API sorğusu atmır (limitə toxunmur):
 import asyncio
 import logging
 import math
+import sys
 import time
 from datetime import datetime, timedelta
 
@@ -34,6 +35,71 @@ _lock = __import__("threading").Lock()
 def init(**kw):
     """main.py-dən çağırılır: lazımi funksiya və dəyişənləri ötürür."""
     _c.update(kw)
+    try:
+        _install_fd_fallback()
+    except Exception:
+        log.exception("proqnoz | football-data ehtiyat yaması qurulmadı (bot normal işləyir)")
+
+
+def _any_rows(matches, team, limit=6):
+    """Komandanın son oyunları (ev+səfər fərqi qoymadan): (vurduğu, buraxdığı), yeni → köhnə."""
+    rows = []
+    ns = _c["name_score"]
+    for mt in sorted(matches, key=lambda x: x.get("utcDate", ""), reverse=True):
+        sc = (mt.get("score") or {}).get("fullTime") or {}
+        hg, ag = sc.get("home"), sc.get("away")
+        if hg is None or ag is None:
+            continue
+        hn = (mt.get("homeTeam") or {}).get("name") or ""
+        an = (mt.get("awayTeam") or {}).get("name") or ""
+        if ns(team, hn) >= 0.85:
+            rows.append((hg, ag))
+        elif ns(team, an) >= 0.85:
+            rows.append((ag, hg))
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _install_fd_fallback():
+    """
+    football-data.org statistikası: komandanın ayrıca 4 EVDƏ və 4 SƏFƏRDƏ oyunu yoxdursa (mövsümün
+    əvvəli) əvvəl 0/N çıxırdı. Bu yama əsas build_fd_info uğursuz olanda komandanın son oyunlarını
+    (harada oynamasından asılı olmayaraq) götürür. bot.py-a toxunmaq lazım deyil.
+    """
+    mod = sys.modules.get("__main__")
+    if mod is None or not hasattr(mod, "build_fd_info") or getattr(mod, "_fd_fallback_on", False):
+        log.info("proqnoz | football-data ehtiyat yaması tətbiq olunmadı")
+        return
+    orig = mod.build_fd_info
+    min_games = _c["min_games"]
+
+    def patched(m, matches, avg_h, avg_a):
+        res = orig(m, matches, avg_h, avg_a)
+        if res:
+            return res
+        h_rows = _any_rows(matches, m.home)
+        a_rows = _any_rows(matches, m.away)
+        if len(h_rows) < min_games or len(a_rows) < min_games:
+            return None
+        h_sc = sum(g for g, _ in h_rows) / len(h_rows)
+        h_co = sum(c for _, c in h_rows) / len(h_rows)
+        a_sc = sum(g for g, _ in a_rows) / len(a_rows)
+        a_co = sum(c for _, c in a_rows) / len(a_rows)
+        league = (avg_h + avg_a) / 2 or 1.0
+        exp_home = max(0.2, (h_sc / league) * (a_co / league) * avg_h)
+        exp_away = max(0.2, (a_sc / league) * (h_co / league) * avg_a)
+        ph, pd, pa = mod._fd_match_probs(exp_home, exp_away)
+
+        def form_str(rows):
+            s = "".join("W" if g > c else ("D" if g == c else "L") for g, c in rows[:5])
+            return s[::-1]
+        return {"ok": True, "pct": [ph, pd, pa], "form": [form_str(h_rows), form_str(a_rows)],
+                "g": [h_sc, h_co, a_sc, a_co], "h2h": [0, 0, 0, 0], "cor": None, "crd": None}
+
+    mod.build_fd_info = patched
+    mod._fd_fallback_on = True
+    log.info("proqnoz | football-data ehtiyat yaması aktivdir (ev/səfər oyunu azdırsa son oyunlara baxır)")
 
 
 # ---------------------------------------------------------------- yardımçılar
