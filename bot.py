@@ -2757,6 +2757,7 @@ def menu_keyboard(lang):
         [InlineKeyboardButton(L["btn_safe"], callback_data="c:safe:0")],
         [InlineKeyboardButton(L["btn_normal"], callback_data="c:normal:0")],
         [InlineKeyboardButton(L["btn_risky"], callback_data="c:risky:0")],
+        [InlineKeyboardButton("📈 Günün analizi", callback_data="pq:new")],
     ])
 
 
@@ -3414,6 +3415,9 @@ def main():
                  peek_snapshot=peek_snapshot, get_lang=stats.get_lang, bot_info=_bot_info,
                  OWNER_NAME=OWNER_NAME, OWNER_HANDLE=OWNER_HANDLE,
                  AZ_EN_TEAM_ALIASES=AZ_EN_TEAM_ALIASES, DEFAULT_LANG=DEFAULT_LANG)
+    proqnoz.init(kvj_get=_kvj_get, TZ=TZ, peek_snapshot=peek_snapshot,
+             name_score=name_score, FD_ORG_COMPETITIONS=FD_ORG_COMPETITIONS,
+             stat_gate=stat_gate, verified=_verified, min_games=FD_ORG_MIN_GAMES)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler(["gununoyunlari", "coupon"], cmd_menu))
     app.add_handler(CommandHandler("lang", cmd_lang))
@@ -3432,6 +3436,8 @@ def main():
     app.add_handler(CommandHandler("kuponumabax", cmd_kuponumabax))
     app.add_handler(MessageHandler(filters.PHOTO, on_coupon_photo))
     app.add_handler(CommandHandler(["komandam", "myteam"], botplus.cmd_team))
+    app.add_handler(CommandHandler(["proqnoz", "analiz"], proqnoz.cmd_proqnoz))
+    app.add_handler(CallbackQueryHandler(proqnoz.on_callback, pattern=r"^pq:"))
     app.add_handler(CallbackQueryHandler(botplus.on_callback, pattern=r"^(s|fav):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, botplus.on_text))
     app.add_handler(CallbackQueryHandler(on_button))
