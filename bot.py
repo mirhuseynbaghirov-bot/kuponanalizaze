@@ -1178,6 +1178,22 @@ _NAME_ALIASES = {
     "wolves": "wolverhampton wanderers", "spurs": "tottenham hotspur", "tottenham": "tottenham hotspur",
     "psg": "paris saint germain", "nottm forest": "nottingham forest", "inter": "inter milan",
     "atletico": "atletico madrid", "sporting": "sporting cp", "sporting lisbon": "sporting cp",
+    # Fransa
+    "lyon": "olympique lyonnais",
+    "brest": "stade brestois 29",
+    "rennes": "stade rennais",
+    "paris fc": "paris football club",   # PSG ilə qarışmasın
+    # İspaniya
+    "rcd espanyol de barcelona": "espanyol",   # Barselona ilə qarışmasın
+    # İtaliya
+    "fc internazionale milano": "inter milan",
+    # Almaniya
+    "bayern munich": "bayern munchen",
+    "fc cologne": "1 fc koln",
+    # Portuqaliya
+    "sporting clube de portugal": "sporting cp",
+    # Çempionlar Liqası
+    "slavia prague": "slavia praha",
 }
 
 
