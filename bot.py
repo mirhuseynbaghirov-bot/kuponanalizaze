@@ -1450,7 +1450,7 @@ def enrich_stats(snap):
 # Bu bölmə API-Football-ı əvəz edir: pulsuz plan, 12 əsas liqa, "hazır proqnoz" yoxdur —
 # özümüz Poisson (hücum/müdafiə gücü) modeli ilə 1X2 ehtimalını hesablayırıq.
 # Korner/kart bu mənbədən gəlmir (bunlar hələ də Odds API bazarından, enrich_extras() vasitəsilə gəlir).
-FOOTBALL_ORG_KEY = env("FOOTBALL_DATA_ORG_KEY", "34670f28fa5543728e78c6f683e19009")
+FOOTBALL_ORG_KEY = env("FOOTBALL_DATA_ORG_KEY", "180ea6414eaf455e9feff122051f1aa7")
 FD_ORG_MODE = bool(FOOTBALL_ORG_KEY)
 FD_ORG_BASE = "https://api.football-data.org/v4"
 FD_ORG_RATE_LIMIT = 10          # sorğu/dəqiqə (pulsuz plan) — avtomatik gözləyərək bu limitə hörmət edilir
