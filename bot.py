@@ -74,6 +74,7 @@ from telegram.ext import (
     filters,
 )
 import botplus
+import proqnoz
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
