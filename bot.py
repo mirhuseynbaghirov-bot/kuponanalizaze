@@ -3435,9 +3435,11 @@ def fd_fetch_matches(code):
     day = datetime.now(TZ).date().isoformat()
     data = FootballOrgAPI(FOOTBALL_ORG_KEY).get(
         f"/competitions/{code}/matches", status="FINISHED")
+    def _t(x):
+        return {"name": (x or {}).get("name"), "crest": (x or {}).get("crest")}
     slim = [{"utcDate": x.get("utcDate"),
-             "homeTeam": {"name": (x.get("homeTeam") or {}).get("name")},
-             "awayTeam": {"name": (x.get("awayTeam") or {}).get("name")},
+             "homeTeam": _t(x.get("homeTeam")),
+             "awayTeam": _t(x.get("awayTeam")),
              "score": {"fullTime": ((x.get("score") or {}).get("fullTime") or {})}}
             for x in data.get("matches", [])]
     if slim:
