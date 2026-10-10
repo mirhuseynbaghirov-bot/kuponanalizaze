@@ -3465,4 +3465,18 @@ def main():
 
 
 if __name__ == "__main__":
+  
+  def fd_fetch_matches(code):
+    day = datetime.now(TZ).date().isoformat()
+    data = FootballOrgAPI(FOOTBALL_ORG_KEY).get(
+        f"/competitions/{code}/matches", status="FINISHED")
+    slim = [{"utcDate": x.get("utcDate"),
+             "homeTeam": {"name": (x.get("homeTeam") or {}).get("name")},
+             "awayTeam": {"name": (x.get("awayTeam") or {}).get("name")},
+             "score": {"fullTime": ((x.get("score") or {}).get("fullTime") or {})}}
+            for x in data.get("matches", [])]
+    if slim:
+        _kvj_set(f"fdorg:matches:{code}:{day}", slim, ex=12 * 3600)
+    return slim
+
     main()
