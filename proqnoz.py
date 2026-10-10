@@ -33,6 +33,7 @@ _c = {}
 _cache = {"t": 0.0, "pages": None}
 _last_click = {}
 _fail = {}               # liqa kodu -> son uğursuz çəkmə vaxtı (10 dəq. təkrar etmə)
+_err = {}                # liqa kodu -> son xəta mətni (mesajda göstərilir)
 _lock = __import__("threading").Lock()
 
 
@@ -123,15 +124,21 @@ def _league_matches(code, cache):
         day = datetime.now(_c["TZ"]).date().isoformat()
         rows = _c["kvj_get"](f"fdorg:matches:{code}:{day}") or []
         fetch = _c.get("fd_fetch")
+        if not rows and not fetch:
+            _err[code] = "main.py-da fd_fetch ötürülməyib"
         if not rows and fetch and time.time() - _fail.get(code, 0) > 600:
             try:
                 rows = fetch(code) or []
                 log.info("proqnoz | %s liqası football-data-dan çəkildi: %d oyun", code, len(rows))
-            except Exception:
+            except Exception as e:
                 log.exception("proqnoz | %s liqası çəkilmədi", code)
+                _err[code] = f"{type(e).__name__}: {str(e)[:60]}"
                 rows = []
             if not rows:
                 _fail[code] = time.time()
+                _err.setdefault(code, "football-data boş cavab verdi")
+        if rows:
+            _err.pop(code, None)
         cache[code] = rows
     return cache[code]
 
@@ -204,6 +211,18 @@ def _own_info(m, code, cache):
     exp_home = max(0.2, (h_sc / league) * (a_co / league) * avg_h)
     exp_away = max(0.2, (a_sc / league) * (h_co / league) * avg_a)
     return {"pct": list(_probs(exp_home, exp_away))}
+
+
+def _why_no_stats(m, code, cache):
+    """Statistikanın niyə olmadığını qısa izah edir (logsuz diaqnostika)."""
+    if not code:
+        return "bu liqa football-data planında yoxdur"
+    lm = _league_matches(code, cache)
+    if not lm:
+        return f"liqa datası alınmadı ({_err.get(code, 'səbəb məlum deyil')})"
+    nh = len(_any_rows(lm, m.home, 5))
+    na = len(_any_rows(lm, m.away, 5))
+    return f"komanda adı tapılmadı və ya az oyun var (ev {nh}, qonaq {na}, liqada {len(lm)} oyun)"
 
 
 def _leg(m, kind, line=None):
@@ -330,7 +349,7 @@ def _fmt_match(i, m, cache):
     bot_side = None
     bot_lean = None
     if v is None:
-        out.append("   ℹ️ Bu oyun üçün statistika yoxdur (liqa əhatə olunmur və ya az oyun var)")
+        out.append(f"   ℹ️ Statistika yoxdur: {_why_no_stats(m, code, cache)}")
     else:
         bot_side = v["side"]
         bot_lean = _lean_team(v["ph"], v["pd"], v["pa"])
