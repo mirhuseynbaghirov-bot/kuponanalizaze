@@ -13,8 +13,10 @@ v2 dəyişikliklər:
 import asyncio
 import logging
 import math
+import re
 import sys
 import time
+import unicodedata
 from datetime import datetime, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -489,6 +491,45 @@ _ccache = {"t": 0.0, "cards": None}
 _clock = __import__("threading").Lock()
 
 
+# ---------------------------------------------------------------- populyar komandalar və loqolar
+_POP = ["real madrid", "barcelona", "atletico", "manchester united", "manchester city", "liverpool",
+        "arsenal", "chelsea", "tottenham", "newcastle", "bayern", "dortmund", "leverkusen",
+        "paris saint", "psg", "marseille", "juventus", "inter", "milan", "napoli", "roma",
+        "ajax", "benfica", "porto", "sporting", "galatasaray", "fenerbahce", "besiktas",
+        "qarabag", "neftchi", "celtic", "rangers"]
+_POP_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k in _POP) + r")\b")
+
+
+def _norm(s):
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    return s
+
+
+def _is_pop(*names):
+    return any(_POP_RE.search(_norm(n)) for n in names)
+
+
+def _crest(code, team, cache):
+    """Komandanın loqosu (football-data.org 'crest' linki). Tapılmasa None (saytda hərf göstərilir)."""
+    if not code:
+        return None
+    key = ("crest", code, team)
+    if key in cache:
+        return cache[key]
+    url = None
+    ns = _c["name_score"]
+    for mt in _league_matches(code, cache):
+        for side in ("homeTeam", "awayTeam"):
+            t = mt.get(side) or {}
+            if t.get("crest") and ns(team, t.get("name") or "") >= 0.85:
+                url = t["crest"]
+                break
+        if url:
+            break
+    cache[key] = url
+    return url
+
+
 def _card(m, cache):
     code = _c["FD_ORG_COMPETITIONS"].get(m.league_key)
     h5 = _team5(code, m.home, cache) if code else None
@@ -544,6 +585,9 @@ def _card(m, cache):
     return {"id": m.id if isinstance(m.id, str) else str(m.id),
             "time": f"{m.start:%H:%M}", "ts": m.start.isoformat(),
             "home": m.home, "away": m.away, "league": m.league,
+            "hlogo": _crest(code, m.home, cache), "alogo": _crest(code, m.away, cache),
+            "pop": _is_pop(m.home, m.away) or "champions league" in _norm(m.league),
+            "has_bot": v is not None,
             "bot": bot, "market": market, "agree": agree, "final": final,
             "score": {"agree": 3, "lean": 2, "conflict": 1, "undecided": 0, "nodata": 0}[agree]}
 
@@ -564,7 +608,10 @@ def build_cards():
             out.append(_card(m, cache))
         except Exception:
             log.exception("proqnoz | sayt kartı %s - %s", m.home, m.away)
-    out.sort(key=lambda c: c["ts"])
+    # sıra: əvvəl botun analiz etdikləri, onların içində populyarlar, sonra saata görə
+    out.sort(key=lambda c: (not c["has_bot"], not c["pop"], c["ts"]))
+    for i, c in enumerate(out):
+        c["rank"] = i
     return out
 
 
