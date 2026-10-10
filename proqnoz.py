@@ -242,8 +242,7 @@ def _lean_team(ph, pd, pa):
     return "home" if ph >= pa else "away"
 
 
-def _lean_line(m, ph, pd, pa, why=""):
-    """Qərarsız oyunda da ən yüksək ehtimalı göstər: '38% ilə 2-ci komanda, amma qərarsız oyundur'."""
+def _lean_text(m, ph, pd, pa, why=""):
     t = _lean_team(ph, pd, pa)
     if t == "draw":
         top = f"Heç-heçə ehtimalı ən yüksəkdir (~{_pc(pd)}%)"
@@ -251,7 +250,12 @@ def _lean_line(m, ph, pd, pa, why=""):
         top = f"Ən yüksək ehtimal: {m.home} (~{_pc(ph)}%)"
     else:
         top = f"Ən yüksək ehtimal: {m.away} (~{_pc(pa)}%)"
-    return f"   🤔 {top}, amma qərarsız oyundur{why}"
+    return f"{top}, amma qərarsız oyundur{why}"
+
+
+def _lean_line(m, ph, pd, pa, why=""):
+    """Qərarsız oyunda da ən yüksək ehtimalı göstər: '38% ilə 2-ci komanda, amma qərarsız oyundur'."""
+    return "   🤔 " + _lean_text(m, ph, pd, pa, why)
 
 
 # ---------------------------------------------------------------- botun analizi
@@ -335,25 +339,24 @@ def _market_side(m):
 
 
 
-def _final_block(m, v, bot_side, bot_lean, mk_side, mk_lean, goal_picks):
-    """🏁 Yekun qərar: 1X2 + qol + korner + kart bir yerdə (bot və bazarın uyğunluğuna görə)."""
-    lines = []
-    # --- 1X2
+def _final_items(m, v, bot_side, bot_lean, mk_side, mk_lean, goal_picks):
+    """Yekun qərar maddələri: [(səviyyə, mətn)]. səviyyə: ok (razı) | part (yalnız biri) | warn | stop."""
+    items = []
+
     def tn(side):
         return m.home if side == "home" else m.away
     if bot_side and bot_side == mk_side:
-        lines.append(f"✅ Nəticə: {tn(bot_side)} qalib (bot + bazar)")
+        items.append(("ok", f"Nəticə: {tn(bot_side)} qalib (bot + bazar)"))
     elif bot_side and mk_side is None:
-        lines.append(f"🔸 Nəticə: {tn(bot_side)} qalib (yalnız bot)")
+        items.append(("part", f"Nəticə: {tn(bot_side)} qalib (yalnız bot)"))
     elif mk_side and bot_side is None and v is None:
-        lines.append(f"🔸 Nəticə: {tn(mk_side)} qalib (yalnız bazar)")
+        items.append(("part", f"Nəticə: {tn(mk_side)} qalib (yalnız bazar)"))
     elif bot_lean and bot_lean == mk_lean and bot_lean != "draw":
-        lines.append(f"⚠️ Nəticə: {tn(bot_lean)}-ə meyil var, amma əmin deyil")
+        items.append(("warn", f"Nəticə: {tn(bot_lean)}-ə meyil var, amma əmin deyil"))
     elif bot_side or mk_side:
-        lines.append("⛔ Nəticə: fikir ayrılığı — keç")
+        items.append(("stop", "Nəticə: fikir ayrılığı — keç"))
     else:
-        lines.append("⛔ Nəticə: qərarsız — keç")
-    # --- qol
+        items.append(("stop", "Nəticə: qərarsız — keç"))
     mk25 = None
     for kind, word in (("over", "Üst"), ("under", "Alt")):
         l = _leg(m, kind, 2.5)
@@ -361,20 +364,34 @@ def _final_block(m, v, bot_side, bot_lean, mk_side, mk_lean, goal_picks):
             mk25 = (word, l.prob)
     b25 = goal_picks.get("2.5")
     if b25 and mk25 and b25[0] == mk25[0]:
-        lines.append(f"✅ Qol: 2.5 {b25[0]} (bot + bazar)")
+        items.append(("ok", f"Qol: 2.5 {b25[0]} (bot + bazar)"))
     elif b25 and not mk25:
-        lines.append(f"🔸 Qol: 2.5 {b25[0]} (yalnız bot)")
+        items.append(("part", f"Qol: 2.5 {b25[0]} (yalnız bot)"))
     elif mk25 and not b25 and not goal_picks.get("1.5"):
-        lines.append(f"🔸 Qol: 2.5 {mk25[0]} (yalnız bazar)")
+        items.append(("part", f"Qol: 2.5 {mk25[0]} (yalnız bazar)"))
     b15 = goal_picks.get("1.5")
     if b15:
-        lines.append(f"🔸 Qol: 1.5 {b15[0]} (yalnız bot)")
-    # --- korner / kart (yalnız bazada olan xətlər)
+        items.append(("part", f"Qol: 1.5 {b15[0]} (yalnız bot)"))
     for grp in ("corners", "cards"):
         t = _extra_pick(m, grp, bot_only=False)
         if t:
-            lines.append(f"{'🚩' if grp == 'corners' else '🟨'} {t}")
-    return ["🏁 YEKUN QƏRAR"] + [f"   {x}" for x in lines]
+            items.append(("part", t))
+    return items
+
+
+_ICON = {"ok": "✅", "part": "🔸", "warn": "⚠️", "stop": "⛔"}
+
+
+def _final_block(m, v, bot_side, bot_lean, mk_side, mk_lean, goal_picks):
+    """🏁 Yekun qərar: 1X2 + qol + korner + kart bir yerdə (bot və bazarın uyğunluğuna görə)."""
+    its = _final_items(m, v, bot_side, bot_lean, mk_side, mk_lean, goal_picks)
+    out = []
+    for lvl, t in its:
+        if t.startswith(("Korner", "Kart")):
+            out.append(f"   {'🚩' if t.startswith('Korner') else '🟨'} {t}")
+        else:
+            out.append(f"   {_ICON[lvl]} {t}")
+    return ["🏁 YEKUN QƏRAR"] + out
 
 
 def _fmt_match(i, m, cache):
@@ -465,6 +482,101 @@ def _fmt_match(i, m, cache):
     out.append(LINE)
     out += _final_block(m, v, bot_side, bot_lean, mk_side, mk_lean, goal_picks)
     return "\n".join(out)
+
+
+# ---------------------------------------------------------------- sayt üçün (webui.py)
+_ccache = {"t": 0.0, "cards": None}
+_clock = __import__("threading").Lock()
+
+
+def _card(m, cache):
+    code = _c["FD_ORG_COMPETITIONS"].get(m.league_key)
+    h5 = _team5(code, m.home, cache) if code else None
+    a5 = _team5(code, m.away, cache) if code else None
+    info = None
+    if _c["verified"](m) and (m.info or {}).get("pct"):
+        info = m.info
+    elif code and h5 and a5:
+        info = _own_info(m, code, cache)
+    v = _bot_verdict(m, h5, a5, info)
+    bot_side = bot_lean = None
+    goal_picks = {}
+    bot = None
+    if v is not None:
+        bot_side = v["side"]
+        bot_lean = _lean_team(v["ph"], v["pd"], v["pa"])
+        if bot_side == "home":
+            txt = f"{m.home} qalib gələcək kimi görünür (~{_pc(v['ph'])}%)"
+        elif bot_side == "away":
+            txt = f"{m.away} qalib gələcək kimi görünür (~{_pc(v['pa'])}%)"
+        else:
+            txt = _lean_text(m, v["ph"], v["pd"], v["pa"], _WHY[v["reason"]])
+        bot = {"text": txt, "decided": bool(bot_side),
+               "pct": [_pc(v["ph"]), _pc(v["pd"]), _pc(v["pa"])]}
+        if h5 and a5:
+            bot["form"] = [_form(h5), _form(a5)]
+            parts, lam, goal_picks = _goal_parts(h5, a5, m)
+            bot["goals"] = parts
+            bot["exp_goals"] = round(lam, 1)
+    else:
+        bot = {"text": "Statistika yoxdur", "decided": False, "pct": None}
+    mk_side, mk_p = _market_side(m)
+    mk_lean = None
+    market = None
+    if m.p3:
+        h, d, a = m.p3
+        mk_lean = _lean_team(h, d, a)
+        market = {"pct": [_pc(h), _pc(d), _pc(a)], "decided": bool(mk_side),
+                  "text": (f"{m.home} (~{_pc(mk_p)}%)" if mk_side == "home" else
+                           f"{m.away} (~{_pc(mk_p)}%)" if mk_side == "away" else
+                           _lean_text(m, h, d, a))}
+    # uyğunluq
+    if v is None:
+        agree = "nodata"
+    elif bot_side and bot_side == mk_side:
+        agree = "agree"
+    elif bot_side is None and mk_side is None:
+        agree = "lean" if (bot_lean and bot_lean == mk_lean and bot_lean != "draw") else "undecided"
+    else:
+        agree = "conflict"
+    final = [{"level": lvl, "text": t}
+             for lvl, t in _final_items(m, v, bot_side, bot_lean, mk_side, mk_lean, goal_picks)]
+    return {"id": m.id if isinstance(m.id, str) else str(m.id),
+            "time": f"{m.start:%H:%M}", "ts": m.start.isoformat(),
+            "home": m.home, "away": m.away, "league": m.league,
+            "bot": bot, "market": market, "agree": agree, "final": final,
+            "score": {"agree": 3, "lean": 2, "conflict": 1, "undecided": 0, "nodata": 0}[agree]}
+
+
+def build_cards():
+    snap, ok, _a = _c["peek_snapshot"]()
+    if snap is None:
+        return None
+    now = datetime.now(_c["TZ"])
+    ms = [m for m in snap.matches
+          if m.start.date() == now.date() and m.start > now + timedelta(minutes=MIN_MINUTES)]
+    ms.sort(key=lambda m: (not _c["verified"](m), m.start))
+    ms = ms[:MAX_MATCHES * 2]
+    cache = {}
+    out = []
+    for m in ms:
+        try:
+            out.append(_card(m, cache))
+        except Exception:
+            log.exception("proqnoz | sayt kartı %s - %s", m.home, m.away)
+    out.sort(key=lambda c: c["ts"])
+    return out
+
+
+def get_cards():
+    """Sayt üçün: 5 dəqiqə keşlənir, əlavə API sorğusu yaratmır. None = baza hələ hazır deyil."""
+    with _clock:
+        if _ccache["cards"] is not None and time.time() - _ccache["t"] < CACHE_TTL:
+            return _ccache["cards"]
+        cards = build_cards()
+        if cards is not None:
+            _ccache.update(t=time.time(), cards=cards)
+        return cards
 
 
 # ---------------------------------------------------------------- səhifələr
