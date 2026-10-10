@@ -3456,8 +3456,6 @@ def main():
     app.add_handler(CommandHandler(["proqnoz", "analiz"], proqnoz.cmd_proqnoz))
     app.add_handler(CallbackQueryHandler(proqnoz.on_callback, pattern=r"^pq:"))
     app.add_handler(CallbackQueryHandler(botplus.on_callback, pattern=r"^(s|fav):"))
-    app.add_handler(CommandHandler(["proqnoz", "analiz"], proqnoz.cmd_proqnoz))
-    app.add_handler(CallbackQueryHandler(proqnoz.on_callback, pattern=r"^pq:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, botplus.on_text))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
