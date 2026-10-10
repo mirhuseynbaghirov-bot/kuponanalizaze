@@ -22,8 +22,8 @@ from telegram.ext import ContextTypes
 
 log = logging.getLogger("proqnoz")
 
-PAGE_SIZE = 4            # bir səhifədə 4 oyun
-MAX_MATCHES = 40         # cəmi 10 səhifə
+PAGE_SIZE = 3            # bir səhifədə 3 oyun
+MAX_MATCHES = 42         # cəmi 14 səhifə
 MIN_MINUTES = 15         # başlamağa 15 dəq. qalmış oyunlar göstərilmir
 CACHE_TTL = 5 * 60
 COOLDOWN = 1.5
@@ -282,18 +282,23 @@ def _goal_parts(h5, a5, m):
     ea = (sum(g for g, _ in a5) / n_a + sum(c for _, c in h5) / n_h) / 2
     lam = eh + ea
     out = []
+    picks = {}
     p25 = _p_over(lam, 2.5)
     mk_o, mk_u = _leg(m, "over", 2.5), _leg(m, "under", 2.5)
     if p25 >= 0.60 and not (mk_u and mk_u.prob >= 0.55):
         out.append(f"2.5 Üst (~{_pc(p25)}%)")
+        picks["2.5"] = ("Üst", p25)
     elif p25 <= 0.40 and not (mk_o and mk_o.prob >= 0.55):
         out.append(f"2.5 Alt (~{_pc(1 - p25)}%)")
+        picks["2.5"] = ("Alt", 1 - p25)
     p15 = _p_over(lam, 1.5)
     if p15 >= 0.75:
         out.append(f"1.5 Üst (~{_pc(p15)}%)")
+        picks["1.5"] = ("Üst", p15)
     elif p15 <= 0.40:
         out.append(f"1.5 Alt (~{_pc(1 - p15)}%)")
-    return out, lam
+        picks["1.5"] = ("Alt", 1 - p15)
+    return out, lam, picks
 
 
 def _extra_pick(m, group, bot_only):
@@ -329,6 +334,49 @@ def _market_side(m):
     return None, None
 
 
+
+def _final_block(m, v, bot_side, bot_lean, mk_side, mk_lean, goal_picks):
+    """🏁 Yekun qərar: 1X2 + qol + korner + kart bir yerdə (bot və bazarın uyğunluğuna görə)."""
+    lines = []
+    # --- 1X2
+    def tn(side):
+        return m.home if side == "home" else m.away
+    if bot_side and bot_side == mk_side:
+        lines.append(f"✅ Nəticə: {tn(bot_side)} qalib (bot + bazar)")
+    elif bot_side and mk_side is None:
+        lines.append(f"🔸 Nəticə: {tn(bot_side)} qalib (yalnız bot)")
+    elif mk_side and bot_side is None and v is None:
+        lines.append(f"🔸 Nəticə: {tn(mk_side)} qalib (yalnız bazar)")
+    elif bot_lean and bot_lean == mk_lean and bot_lean != "draw":
+        lines.append(f"⚠️ Nəticə: {tn(bot_lean)}-ə meyil var, amma əmin deyil")
+    elif bot_side or mk_side:
+        lines.append("⛔ Nəticə: fikir ayrılığı — keç")
+    else:
+        lines.append("⛔ Nəticə: qərarsız — keç")
+    # --- qol
+    mk25 = None
+    for kind, word in (("over", "Üst"), ("under", "Alt")):
+        l = _leg(m, kind, 2.5)
+        if l and l.prob >= 0.55 and (mk25 is None or l.prob > mk25[1]):
+            mk25 = (word, l.prob)
+    b25 = goal_picks.get("2.5")
+    if b25 and mk25 and b25[0] == mk25[0]:
+        lines.append(f"✅ Qol: 2.5 {b25[0]} (bot + bazar)")
+    elif b25 and not mk25:
+        lines.append(f"🔸 Qol: 2.5 {b25[0]} (yalnız bot)")
+    elif mk25 and not b25 and not goal_picks.get("1.5"):
+        lines.append(f"🔸 Qol: 2.5 {mk25[0]} (yalnız bazar)")
+    b15 = goal_picks.get("1.5")
+    if b15:
+        lines.append(f"🔸 Qol: 1.5 {b15[0]} (yalnız bot)")
+    # --- korner / kart (yalnız bazada olan xətlər)
+    for grp in ("corners", "cards"):
+        t = _extra_pick(m, grp, bot_only=False)
+        if t:
+            lines.append(f"{'🚩' if grp == 'corners' else '🟨'} {t}")
+    return ["🏁 YEKUN QƏRAR"] + [f"   {x}" for x in lines]
+
+
 def _fmt_match(i, m, cache):
     code = _c["FD_ORG_COMPETITIONS"].get(m.league_key)
     h5 = _team5(code, m.home, cache) if code else None
@@ -348,6 +396,7 @@ def _fmt_match(i, m, cache):
     v = _bot_verdict(m, h5, a5, info)
     bot_side = None
     bot_lean = None
+    goal_picks = {}
     if v is None:
         out.append(f"   ℹ️ Statistika yoxdur: {_why_no_stats(m, code, cache)}")
     else:
@@ -362,7 +411,7 @@ def _fmt_match(i, m, cache):
         out.append(f"   🎯 Model 1/X/2: {_pc(v['ph'])}/{_pc(v['pd'])}/{_pc(v['pa'])}%")
     if h5 and a5:
         out.append(f"   📈 Son 5: {H} {_form(h5)} · {A} {_form(a5)}")
-        parts, lam = _goal_parts(h5, a5, m)
+        parts, lam, goal_picks = _goal_parts(h5, a5, m)
         if parts:
             out.append(f"   ⚽ Qol: {' · '.join(parts)} (gözlənən ~{lam:.1f})")
         elif v is not None:
@@ -413,6 +462,8 @@ def _fmt_match(i, m, cache):
                 out.append("🟡 İkisi də qərarsızdır — keç")
         else:
             out.append("🟡 Fikir ayrılığı var — risk yüksəkdir")
+    out.append(LINE)
+    out += _final_block(m, v, bot_side, bot_lean, mk_side, mk_lean, goal_picks)
     return "\n".join(out)
 
 
