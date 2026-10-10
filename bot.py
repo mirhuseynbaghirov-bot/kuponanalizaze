@@ -75,6 +75,7 @@ from telegram.ext import (
 )
 import botplus
 import proqnoz
+import webui
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -3392,11 +3393,29 @@ class Ping(BaseHTTPRequestHandler):
     def _status(self):
         return 200 if time.time() - _beat["t"] < DEAD_AFTER else 500
 
+    def _ip(self):
+        return (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+
     def do_GET(self):
         code = self._status()
-        self.send_response(code)
+        try:
+            res = webui.handle(self.path, self._ip())
+        except Exception:
+            res = None
+        if res is None:
+            self.send_response(code)
+            self.end_headers()
+            self.wfile.write(b"ok" if code == 200 else b"bot down")
+            return
+        st, ctype, body = res
+        if st == 200 and code != 200 and self.path.split("?")[0] == "/":
+            st = code                       # bot donubsa, ana ünvan əvvəlki kimi 500 qaytarsın
+        self.send_response(st)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store" if ctype.startswith("application/json") else "public, max-age=60")
         self.end_headers()
-        self.wfile.write(b"ok" if code == 200 else b"bot down")
+        self.wfile.write(body)
 
     def do_HEAD(self):
         self.send_response(self._status())
@@ -3407,8 +3426,10 @@ class Ping(BaseHTTPRequestHandler):
 
 
 def keep_alive():
+    from http.server import ThreadingHTTPServer      # sayt və ping bir-birini gözləməsin
     port = env_int("PORT", 10000)
-    HTTPServer(("0.0.0.0", port), Ping).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", port), Ping).serve_forever()
+
 
 def fd_fetch_matches(code):
     day = datetime.now(TZ).date().isoformat()
