@@ -1,11 +1,14 @@
 """
 proqnoz.py — /proqnoz (günün oyunları üzrə analiz) modulu.
 
-Heç bir yeni API sorğusu atmır (limitə toxunmur):
-  * Botun analizi  -> football-data.org-dan artıq Redis-də keşlənmiş son oyunlar (fdorg:matches:...)
-                      + mövcud Poisson modeli (m.info) + hər komandanın SON 5 oyunu
+Bazara/botun əsas axınına toxunmur:
+  * Botun analizi  -> football-data.org (liqa üzrə gündə 1 sorğu, Redis-də keşlənir)
+                      + Poisson modeli + hər komandanın SON 5 oyunu
   * Bazarın seçimi -> Odds API-dan artıq bazada olan keflər (m.p3, m.legs)
-Əmin olmayanda "Qərarsız oyun" deyir.
+v2 dəyişikliklər:
+  * Keş boşdursa liqanın oyunlarını özü çəkir (fd_fetch) — baza statistikası alınmasa da işləyir
+  * m.info yoxdursa statistikanı özü hesablayır
+  * "Qərarsız oyun" olanda ən yüksək ehtimalı və səbəbi də göstərir
 """
 import asyncio
 import logging
@@ -29,6 +32,7 @@ LINE = "━━━━━━━━━━━━━━"
 _c = {}
 _cache = {"t": 0.0, "pages": None}
 _last_click = {}
+_fail = {}               # liqa kodu -> son uğursuz çəkmə vaxtı (10 dəq. təkrar etmə)
 _lock = __import__("threading").Lock()
 
 
@@ -45,7 +49,7 @@ def _any_rows(matches, team, limit=6):
     """Komandanın son oyunları (ev+səfər fərqi qoymadan): (vurduğu, buraxdığı), yeni → köhnə."""
     rows = []
     ns = _c["name_score"]
-    for mt in sorted(matches, key=lambda x: x.get("utcDate", ""), reverse=True):
+    for mt in sorted(matches, key=lambda x: x.get("utcDate", "") or "", reverse=True):
         sc = (mt.get("score") or {}).get("fullTime") or {}
         hg, ag = sc.get("home"), sc.get("away")
         if hg is None or ag is None:
@@ -112,11 +116,23 @@ def _sn(name):
 
 
 def _league_matches(code, cache):
+    """Liqanın bitmiş oyunları. Redis keşi boşdursa football-data-dan özü çəkir (10 dəq. fasilə ilə)."""
     if not code:
         return []
     if code not in cache:
         day = datetime.now(_c["TZ"]).date().isoformat()
-        cache[code] = _c["kvj_get"](f"fdorg:matches:{code}:{day}") or []
+        rows = _c["kvj_get"](f"fdorg:matches:{code}:{day}") or []
+        fetch = _c.get("fd_fetch")
+        if not rows and fetch and time.time() - _fail.get(code, 0) > 600:
+            try:
+                rows = fetch(code) or []
+                log.info("proqnoz | %s liqası football-data-dan çəkildi: %d oyun", code, len(rows))
+            except Exception:
+                log.exception("proqnoz | %s liqası çəkilmədi", code)
+                rows = []
+            if not rows:
+                _fail[code] = time.time()
+        cache[code] = rows
     return cache[code]
 
 
@@ -125,21 +141,7 @@ def _team5(code, team, cache):
     key = ("t5", code, team)
     if key in cache:
         return cache[key]
-    rows = []
-    ns = _c["name_score"]
-    for mt in sorted(_league_matches(code, cache), key=lambda x: x.get("utcDate", ""), reverse=True):
-        sc = (mt.get("score") or {}).get("fullTime") or {}
-        hg, ag = sc.get("home"), sc.get("away")
-        if hg is None or ag is None:
-            continue
-        hn = (mt.get("homeTeam") or {}).get("name") or ""
-        an = (mt.get("awayTeam") or {}).get("name") or ""
-        if ns(team, hn) >= 0.85:
-            rows.append((hg, ag))
-        elif ns(team, an) >= 0.85:
-            rows.append((ag, hg))
-        if len(rows) >= 5:
-            break
+    rows = _any_rows(_league_matches(code, cache), team, 5)
     res = rows if len(rows) >= _c["min_games"] else None
     cache[key] = res
     return res
@@ -158,36 +160,104 @@ def _p_over(lam, line):
     return 1 - sum(math.exp(-lam) * lam ** i / math.factorial(i) for i in range(k + 1))
 
 
+def _probs(eh, ea, mx=7):
+    """Gözlənən qollardan (Poisson) 1X2 ehtimalı."""
+    ph = [math.exp(-eh) * eh ** i / math.factorial(i) for i in range(mx + 1)]
+    pa = [math.exp(-ea) * ea ** i / math.factorial(i) for i in range(mx + 1)]
+    h = d = a = 0.0
+    for i in range(mx + 1):
+        for j in range(mx + 1):
+            p = ph[i] * pa[j]
+            if i > j:
+                h += p
+            elif i == j:
+                d += p
+            else:
+                a += p
+    t = h + d + a
+    return (h / t, d / t, a / t) if t > 0 else (1 / 3, 1 / 3, 1 / 3)
+
+
+def _own_info(m, code, cache):
+    """Bazada m.info yoxdursa, liqa datasından özümüz 1X2 ehtimalı hesablayırıq (son 6 oyun, ev/səfər fərqsiz)."""
+    lm = _league_matches(code, cache)
+    h_rows = _any_rows(lm, m.home)
+    a_rows = _any_rows(lm, m.away)
+    mg = _c["min_games"]
+    if len(h_rows) < mg or len(a_rows) < mg:
+        return None
+    hs = as_ = n = 0
+    for mt in lm:
+        sc = (mt.get("score") or {}).get("fullTime") or {}
+        hg, ag = sc.get("home"), sc.get("away")
+        if hg is None or ag is None:
+            continue
+        hs += hg
+        as_ += ag
+        n += 1
+    avg_h, avg_a = (hs / n, as_ / n) if n >= 10 else (1.5, 1.2)
+    league = (avg_h + avg_a) / 2 or 1.0
+    h_sc = sum(g for g, _ in h_rows) / len(h_rows)
+    h_co = sum(c for _, c in h_rows) / len(h_rows)
+    a_sc = sum(g for g, _ in a_rows) / len(a_rows)
+    a_co = sum(c for _, c in a_rows) / len(a_rows)
+    exp_home = max(0.2, (h_sc / league) * (a_co / league) * avg_h)
+    exp_away = max(0.2, (a_sc / league) * (h_co / league) * avg_a)
+    return {"pct": list(_probs(exp_home, exp_away))}
+
+
 def _leg(m, kind, line=None):
     c = [l for l in m.legs if l.kind == kind and (line is None or l.line == line)]
     return max(c, key=lambda l: l.prob) if c else None
 
 
+# ---------------------------------------------------------------- qərarsız mətni
+_WHY = {"form": " (forma əks tərəfi göstərir)",
+        "market": " (bazar əks tərəfi üstün tutur)",
+        "close": ""}
+
+
+def _lean_team(ph, pd, pa):
+    if pd > max(ph, pa):
+        return "draw"
+    return "home" if ph >= pa else "away"
+
+
+def _lean_line(m, ph, pd, pa, why=""):
+    """Qərarsız oyunda da ən yüksək ehtimalı göstər: '38% ilə 2-ci komanda, amma qərarsız oyundur'."""
+    t = _lean_team(ph, pd, pa)
+    if t == "draw":
+        top = f"Heç-heçə ehtimalı ən yüksəkdir (~{_pc(pd)}%)"
+    elif t == "home":
+        top = f"Ən yüksək ehtimal: {m.home} (~{_pc(ph)}%)"
+    else:
+        top = f"Ən yüksək ehtimal: {m.away} (~{_pc(pa)}%)"
+    return f"   🤔 {top}, amma qərarsız oyundur{why}"
+
+
 # ---------------------------------------------------------------- botun analizi
-def _bot_verdict(m, h5, a5):
-    """Qalib yalnız model + son 5 oyun forması + bazar bir-birinə ZİD DÜŞMƏSƏ verilir. Əks halda None (qərarsız)."""
-    if not (_c["verified"](m) and m.info.get("pct") and h5 and a5):
+def _bot_verdict(m, h5, a5, info):
+    """Qalib yalnız model + son 5 oyun forması + bazar bir-birinə ZİD DÜŞMƏSƏ verilir. Əks halda side=None (qərarsız)."""
+    if not (info and info.get("pct") and h5 and a5):
         return None
-    ph, pd, pa = m.info["pct"]
+    ph, pd, pa = info["pct"]
     fd = _ppg(h5) - _ppg(a5)
-    side = None
-    if ph - pa >= 0.12 and ph >= 0.42:
+    side, reason = None, "close"
+    if ph - pa >= 0.10 and ph >= 0.40:
         side = "home"
-    elif pa - ph >= 0.12 and pa >= 0.42:
+    elif pa - ph >= 0.10 and pa >= 0.40:
         side = "away"
     if (side == "home" and fd <= -0.3) or (side == "away" and fd >= 0.3):
-        side = None                                   # forma modelə ziddir
+        side, reason = None, "form"                   # forma modelə ziddir
     if side and m.p3:
         mh, _d, ma = m.p3
         if (side == "home" and ma - mh > 0.05) or (side == "away" and mh - ma > 0.05):
-            side = None                               # bazar əks tərəfi üstün tutur
-    return {"side": side, "ph": ph, "pd": pd, "pa": pa}
+            side, reason = None, "market"             # bazar əks tərəfi üstün tutur
+    return {"side": side, "ph": ph, "pd": pd, "pa": pa, "reason": reason}
 
 
 def _goal_parts(h5, a5, m):
     """2.5 və 1.5 Üst/Alt — yalnız kifayət qədər əminlik olanda."""
-    if not (h5 and a5):
-        return []
     n_h, n_a = len(h5), len(a5)
     eh = (sum(g for g, _ in h5) / n_h + sum(c for _, c in a5) / n_a) / 2
     ea = (sum(g for g, _ in a5) / n_a + sum(c for _, c in h5) / n_h) / 2
@@ -246,22 +316,30 @@ def _fmt_match(i, m, cache):
     a5 = _team5(code, m.away, cache) if code else None
     H, A = _sn(m.home), _sn(m.away)
 
+    info = None
+    if _c["verified"](m) and (m.info or {}).get("pct"):
+        info = m.info
+    elif code and h5 and a5:
+        info = _own_info(m, code, cache)
+
     out = [f"{i}. 🕒 {m.start:%H:%M} · {m.home} - {m.away}", f"🏟 {m.league}", LINE,
            "🤖 Botun analizi — Yekun rəy"]
 
     # --- bot bloku
-    v = _bot_verdict(m, h5, a5)
+    v = _bot_verdict(m, h5, a5, info)
     bot_side = None
+    bot_lean = None
     if v is None:
         out.append("   ℹ️ Bu oyun üçün statistika yoxdur (liqa əhatə olunmur və ya az oyun var)")
     else:
         bot_side = v["side"]
+        bot_lean = _lean_team(v["ph"], v["pd"], v["pa"])
         if bot_side == "home":
             out.append(f"   ✅ {m.home} qalib gələcək kimi görünür (~{_pc(v['ph'])}%)")
         elif bot_side == "away":
             out.append(f"   ✅ {m.away} qalib gələcək kimi görünür (~{_pc(v['pa'])}%)")
         else:
-            out.append("   🤝 Qərarsız oyun")
+            out.append(_lean_line(m, v["ph"], v["pd"], v["pa"], _WHY[v["reason"]]))
         out.append(f"   🎯 Model 1/X/2: {_pc(v['ph'])}/{_pc(v['pd'])}/{_pc(v['pa'])}%")
     if h5 and a5:
         out.append(f"   📈 Son 5: {H} {_form(h5)} · {A} {_form(a5)}")
@@ -278,14 +356,16 @@ def _fmt_match(i, m, cache):
     # --- bazar bloku
     out += [LINE, "👥 İstifadəçilərin seçdikləri — Yekun rəy"]
     mk_side, mk_p = _market_side(m)
+    mk_lean = None
     if m.p3:
         h, d, a = m.p3
+        mk_lean = _lean_team(h, d, a)
         if mk_side == "home":
             out.append(f"   ✅ {m.home} (~{_pc(mk_p)}%)")
         elif mk_side == "away":
             out.append(f"   ✅ {m.away} (~{_pc(mk_p)}%)")
         else:
-            out.append("   🤝 Qərarsız oyun")
+            out.append(_lean_line(m, h, d, a))
         out.append(f"   📊 1/X/2: {_pc(h)}/{_pc(d)}/{_pc(a)}%")
     else:
         out.append("   ℹ️ Bazar məlumatı yoxdur")
@@ -307,7 +387,11 @@ def _fmt_match(i, m, cache):
         if bot_side and bot_side == mk_side:
             out.append("🟢 Bot və bazar eyni fikirdədir")
         elif bot_side is None and mk_side is None:
-            out.append("🟡 İkisi də qərarsızdır — keç")
+            if bot_lean and bot_lean == mk_lean and bot_lean != "draw":
+                team = m.home if bot_lean == "home" else m.away
+                out.append(f"🟡 İkisi də {team}-ə meyillidir, amma əmin deyil — risk yüksəkdir")
+            else:
+                out.append("🟡 İkisi də qərarsızdır — keç")
         else:
             out.append("🟡 Fikir ayrılığı var — risk yüksəkdir")
     return "\n".join(out)
