@@ -98,8 +98,15 @@ input:focus,select:focus{border-color:var(--red)}
 .ch{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--bg2);
   font-size:12.5px;color:var(--mut)}
 .time{color:#fff;font-weight:800;background:var(--red);border-radius:6px;padding:2px 8px;font-size:13px}
-.teams{padding:12px 14px 6px;font-size:18px;font-weight:800;line-height:1.25}
-.teams span{color:var(--mut);font-weight:500;font-size:14px;padding:0 4px}
+.tm{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:800;line-height:1.25;padding:3px 0}
+.teams{padding:12px 14px 4px}
+.lgo{position:relative;flex:0 0 32px;width:32px;height:32px;border-radius:50%;background:#26262d;
+  display:inline-flex;align-items:center;justify-content:center;overflow:hidden;font-size:14px;font-weight:800;color:#c8c8d0}
+.lgo img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;padding:3px;background:#f4f4f5}
+.pop{font-size:11px;font-weight:800;color:#ffb199;background:#3a1710;border-radius:6px;padding:2px 7px;margin-left:6px}
+.more{display:block;width:100%;margin:16px 0 0;padding:14px;border-radius:12px;border:1px solid var(--red);
+  background:transparent;color:#fff;font-size:15px;font-weight:700;cursor:pointer}
+.more:hover,.more:active{background:var(--red)}
 .sec{padding:8px 14px}
 .sec h4{font-size:12px;letter-spacing:.6px;text-transform:uppercase;color:var(--mut);margin-bottom:5px;font-weight:700}
 .sec p{font-size:14px}
@@ -151,6 +158,7 @@ footer b{color:#ffd7da}
     <div class="row">
       <input type="search" id="q" placeholder="Komanda axtar…" autocomplete="off">
       <select id="sort">
+        <option value="rank">Analiz olunanlar + populyar</option>
         <option value="time">Saata görə</option>
         <option value="conf">Ən əmin olanlar əvvəl</option>
       </select>
@@ -170,6 +178,7 @@ footer b{color:#ffd7da}
 
   <div class="count" id="count"></div>
   <div class="grid" id="grid"></div>
+  <button class="more hide" id="more"></button>
   <div class="empty" id="state"><div class="spin"></div>Yüklənir…</div>
 
   <footer>
@@ -184,7 +193,8 @@ footer b{color:#ffd7da}
 
 <script>
 const $ = s => document.querySelector(s);
-let ALL = [], LEAGUE = "", timer = null;
+let ALL = [], LEAGUE = "", timer = null, SHOWN = 5;
+const STEP = 5;
 
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const BADGE = {
@@ -207,6 +217,12 @@ function form(f, h, a){
   return `<div class="form" style="flex-wrap:wrap">Son 5: <span>${esc(h)}</span> ${one(f[0])} <span style="margin-left:6px">${esc(a)}</span> ${one(f[1])}</div>`;
 }
 
+function logo(url, name){
+  const l = esc((name || "?").trim().charAt(0).toUpperCase());
+  const img = url ? `<img src="${esc(url)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">` : "";
+  return `<span class="lgo">${l}${img}</span>`;
+}
+
 function card(c){
   const [bc, bt] = BADGE[c.agree] || BADGE.nodata;
   let bot = `<div class="sec"><h4>🤖 Botun analizi</h4><p>${esc(c.bot.text)}</p>${bar(c.bot.pct)}`;
@@ -221,8 +237,9 @@ function card(c){
   const fin = c.final.map(f => `<div class="fi ${f.level}"><span>${ICON[f.level] || "🔸"}</span><span>${esc(f.text)}</span></div>`).join("");
   return `<article class="card ${c.agree}">
     <div class="ch"><span>🏟 ${esc(c.league)}</span><span class="time">${esc(c.time)}</span></div>
-    <div class="teams">${esc(c.home)}<span>vs</span>${esc(c.away)}</div>
-    <div class="sec" style="padding-top:2px"><span class="badge ${bc}" style="margin-left:0">${bt}</span></div>
+    <div class="teams"><div class="tm">${logo(c.hlogo, c.home)}<span>${esc(c.home)}</span></div>
+      <div class="tm">${logo(c.alogo, c.away)}<span>${esc(c.away)}</span></div></div>
+    <div class="sec" style="padding-top:2px"><span class="badge ${bc}" style="margin-left:0">${bt}</span>${c.pop ? '<span class="pop">🔥 Populyar</span>' : ""}</div>
     ${bot}${mk}
     <div class="final"><h4>🏁 YEKUN QƏRAR</h4>${fin}</div>
     <div class="note">Bu proqnozdur, qumar tövsiyəsi deyil. Qərarsız oyunu oynama. 18+</div>
@@ -244,9 +261,15 @@ function render(){
     if(when === "night" && !(h >= 22 || h < 6)) return false;
     return true;
   });
+  if(sort === "rank") list.sort((a, b) => a.rank - b.rank);
+  if(sort === "time") list.sort((a, b) => a.ts.localeCompare(b.ts));
   if(sort === "conf") list.sort((a, b) => b.score - a.score || a.ts.localeCompare(b.ts));
-  $("#grid").innerHTML = list.map(card).join("");
-  $("#count").textContent = list.length ? `${list.length} oyun göstərilir` : "";
+  const part = list.slice(0, SHOWN);
+  $("#grid").innerHTML = part.map(card).join("");
+  $("#count").textContent = list.length ? `${part.length} / ${list.length} oyun göstərilir` : "";
+  const more = $("#more");
+  if(list.length > SHOWN){ more.classList.remove("hide"); more.textContent = `Daha çox göstər (${Math.min(STEP, list.length - SHOWN)} oyun)`; }
+  else more.classList.add("hide");
   const st = $("#state");
   if(list.length){ st.classList.add("hide"); }
   else { st.classList.remove("hide"); st.innerHTML = ALL.length ? "Bu filtrlərə uyğun oyun tapılmadı." : "Bu gün analiz ediləcək oyun qalmayıb."; }
@@ -257,7 +280,7 @@ function buildLeagues(){
   const box = $("#leagues");
   box.innerHTML = [`<span class="chip ${LEAGUE ? "" : "on"}" data-l="">Hamısı</span>`]
     .concat(names.map(n => `<span class="chip ${LEAGUE === n ? "on" : ""}" data-l="${esc(n)}">${esc(n)}</span>`)).join("");
-  box.querySelectorAll(".chip").forEach(el => el.onclick = () => { LEAGUE = el.dataset.l; buildLeagues(); render(); });
+  box.querySelectorAll(".chip").forEach(el => el.onclick = () => { LEAGUE = el.dataset.l; SHOWN = STEP; buildLeagues(); render(); });
 }
 
 async function load(){
@@ -277,7 +300,8 @@ async function load(){
   }
   clearTimeout(timer); timer = setTimeout(load, 5 * 60 * 1000);
 }
-["q", "onlyAgree", "hideBad", "when", "sort"].forEach(id => $("#" + id).addEventListener(id === "q" ? "input" : "change", render));
+["q", "onlyAgree", "hideBad", "when", "sort"].forEach(id => $("#" + id).addEventListener(id === "q" ? "input" : "change", () => { SHOWN = STEP; render(); }));
+$("#more").onclick = () => { SHOWN += STEP; render(); };
 load();
 </script>
 </body>
