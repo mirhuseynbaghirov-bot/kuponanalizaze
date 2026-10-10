@@ -3432,6 +3432,7 @@ def main():
                  OWNER_NAME=OWNER_NAME, OWNER_HANDLE=OWNER_HANDLE,
                  AZ_EN_TEAM_ALIASES=AZ_EN_TEAM_ALIASES, DEFAULT_LANG=DEFAULT_LANG)
     proqnoz.init(kvj_get=_kvj_get, TZ=TZ, peek_snapshot=peek_snapshot,
+             fd_fetch=fd_fetch_matches,
              name_score=name_score, FD_ORG_COMPETITIONS=FD_ORG_COMPETITIONS,
              stat_gate=stat_gate, verified=_verified, min_games=FD_ORG_MIN_GAMES)
     app.add_handler(CommandHandler("start", cmd_start))
