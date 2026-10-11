@@ -52,6 +52,7 @@ PAGE = r"""<!doctype html>
 <title>ProqnozAze — Günün futbol proqnozları</title>
 <meta name="description" content="ProqnozAze: günün futbol oyunları üçün statistika və bazar əsaslı proqnozlar. Bu qumar tövsiyəsi deyil.">
 <meta name="theme-color" content="#0b0b0d">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 512 512%22 width=%22512%22 height=%22512%22%3E  %3Cdefs%3E    %3ClinearGradient id=%22r%22 x1=%220%22 y1=%221%22 x2=%221%22 y2=%220%22%3E      %3Cstop offset=%220%22 stop-color=%22%23b3001b%22/%3E%3Cstop offset=%221%22 stop-color=%22%23ff3b4a%22/%3E    %3C/linearGradient%3E    %3CradialGradient id=%22g%22 cx=%2275%25%22 cy=%220%25%22 r=%2290%25%22%3E      %3Cstop offset=%220%22 stop-color=%22%233a0d13%22/%3E%3Cstop offset=%221%22 stop-color=%22%230b0b0d%22/%3E    %3C/radialGradient%3E  %3C/defs%3E  %3Crect width=%22512%22 height=%22512%22 rx=%22112%22 fill=%22url(%23g)%22/%3E  %3Crect x=%2210%22 y=%2210%22 width=%22492%22 height=%22492%22 rx=%22104%22 fill=%22none%22 stroke=%22%23e11d2e%22 stroke-width=%226%22 opacity=%22.55%22/%3E  %3C%21-- top ball --%3E  %3Ccircle cx=%22256%22 cy=%22262%22 r=%22150%22 fill=%22%230b0b0d%22 stroke=%22%23f4f4f5%22 stroke-width=%2216%22/%3E  %3Cpolygon points=%22256,196 306,232 287,291 225,291 206,232%22 fill=%22%23f4f4f5%22/%3E  %3Cg stroke=%22%23f4f4f5%22 stroke-width=%2212%22 stroke-linecap=%22round%22%3E    %3Cline x1=%22256%22 y1=%22196%22 x2=%22256%22 y2=%22124%22/%3E    %3Cline x1=%22306%22 y1=%22232%22 x2=%22372%22 y2=%22208%22/%3E    %3Cline x1=%22287%22 y1=%22291%22 x2=%22330%22 y2=%22350%22/%3E    %3Cline x1=%22225%22 y1=%22291%22 x2=%22182%22 y2=%22350%22/%3E    %3Cline x1=%22206%22 y1=%22232%22 x2=%22140%22 y2=%22208%22/%3E  %3C/g%3E  %3C%21-- rising arrow --%3E  %3Cpath d=%22M92 400 L190 318 L244 358 L396 196%22 fill=%22none%22 stroke=%22url(%23r)%22 stroke-width=%2230%22        stroke-linecap=%22round%22 stroke-linejoin=%22round%22/%3E  %3Cpath d=%22M330 176 L424 168 L416 262 Z%22 fill=%22%23ff3b4a%22/%3E%3C/svg%3E">
 <style>
 :root{
   --bg:#0b0b0d; --bg2:#141418; --card:#17171c; --line:#2a2a31;
@@ -66,6 +67,8 @@ body{background:var(--bg);color:var(--txt);font:15px/1.45 system-ui,-apple-syste
 header{padding:22px 0 14px;display:flex;align-items:center;justify-content:space-between;gap:12px}
 .logo{font-size:28px;font-weight:900;letter-spacing:-.5px}
 .logo b{color:var(--red)}
+.brand{display:flex;align-items:center;gap:12px}
+.mark{width:48px;height:48px;flex:0 0 48px}
 .logo small{display:block;font-size:12px;font-weight:500;color:var(--mut);letter-spacing:0;margin-top:2px}
 .age{border:2px solid var(--red);color:var(--red2);font-weight:800;border-radius:999px;padding:4px 10px;font-size:13px}
 .disc{background:linear-gradient(90deg,#2a0c10,#1a1013);border:1px solid #4a1a20;border-left:4px solid var(--red);
@@ -142,7 +145,7 @@ footer b{color:#ffd7da}
 <body>
 <div class="wrap">
   <header>
-    <div class="logo">Proqnoz<b>Aze</b><small>Günün futbol proqnozları · Bakı vaxtı ilə</small></div>
+    <div class="logo brand"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" class="mark">  <defs>    <linearGradient id="rr" x1="0" y1="1" x2="1" y2="0">      <stop offset="0" stop-color="#b3001b"/><stop offset="1" stop-color="#ff3b4a"/>    </linearGradient>    <radialGradient id="gg" cx="75%" cy="0%" r="90%">      <stop offset="0" stop-color="#3a0d13"/><stop offset="1" stop-color="#0b0b0d"/>    </radialGradient>  </defs>  <rect width="512" height="512" rx="112" fill="url(#gg)"/>  <rect x="10" y="10" width="492" height="492" rx="104" fill="none" stroke="#e11d2e" stroke-width="6" opacity=".55"/>  <!-- top ball -->  <circle cx="256" cy="262" r="150" fill="#0b0b0d" stroke="#f4f4f5" stroke-width="16"/>  <polygon points="256,196 306,232 287,291 225,291 206,232" fill="#f4f4f5"/>  <g stroke="#f4f4f5" stroke-width="12" stroke-linecap="round">    <line x1="256" y1="196" x2="256" y2="124"/>    <line x1="306" y1="232" x2="372" y2="208"/>    <line x1="287" y1="291" x2="330" y2="350"/>    <line x1="225" y1="291" x2="182" y2="350"/>    <line x1="206" y1="232" x2="140" y2="208"/>  </g>  <!-- rising arrow -->  <path d="M92 400 L190 318 L244 358 L396 196" fill="none" stroke="url(#rr)" stroke-width="30"        stroke-linecap="round" stroke-linejoin="round"/>  <path d="M330 176 L424 168 L416 262 Z" fill="#ff3b4a"/></svg><div>Proqnoz<b>Aze</b><small>Günün futbol proqnozları · Bakı vaxtı ilə</small></div></div>
     <div class="age">18+</div>
   </header>
 
